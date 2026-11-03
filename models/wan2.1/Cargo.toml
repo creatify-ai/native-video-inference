@@ -1,0 +1,39 @@
+[package]
+name = "wan21-native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+autobins = false
+description = "Official Wan 2.1 I2V-14B inference, bitwise identical to the PyTorch reference on B200"
+
+[features]
+default = []
+# core_infra::model_load: streaming in-place checkpoint loads (links core_infra/kernels/convert.cu).
+cuda = ["native-core-infra/model-load"]
+
+[dependencies]
+native-core-infra = { path = "../../core_infra" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+png = "=0.17.16"
+tokenizers = { package = "native-tokenizers", path = "../../vendor/native-tokenizers", version = "=0.22.2", default-features = false, features = ["onig"] }
+
+[lib]
+path = "lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "wan21-playground"
+path = "bin/wan21-playground.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "wan21-generate"
+path = "bin/wan21-generate.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "wan21-server"
+path = "bin/wan21-server.rs"
+required-features = ["cuda"]

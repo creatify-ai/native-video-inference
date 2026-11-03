@@ -1,0 +1,18 @@
+[workspace]
+exclude = ["vendor/native-tokenizers"]
+resolver = "2"
+members = [
+    "core_infra",
+    "models/minimax_h3_official/pipeline",
+    "models/minimax_h3_official/text_encoder",
+    "models/minimax_h3_official/transformer",
+    "models/minimax_h3_official/transformer/router",
+    "models/minimax_h3_official/video_vae",
+    "models/minimax_h3_official/video_vae/router",
+    "models/minimax_h3_official/audio_vae",
+    "models/wan2.1",
+    "models/ltx25"
+]
+
+[profile.release]
+debug = 1

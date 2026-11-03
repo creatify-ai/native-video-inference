@@ -1,0 +1,8 @@
+{
+  "prompt": "The subject walks through a garden.",
+  "reference_descriptor": "/models/inputs/reference-image.json",
+  "width": 768,
+  "height": 768,
+  "num_frames": 124,
+  "seed": 0
+}

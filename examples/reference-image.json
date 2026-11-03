@@ -1,0 +1,12 @@
+{
+  "schema": "h3-ref2va-normalized-rgb-v1",
+  "references": [
+    {
+      "type": "image",
+      "file": "/models/inputs/reference.rgb",
+      "width": 1536,
+      "height": 1536,
+      "has_audio": false
+    }
+  ]
+}

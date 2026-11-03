@@ -1,0 +1,23 @@
+# Local tools and build output
+/.venv/
+/target/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.DS_Store
+.env
+
+# Model assets and inference output
+/artifacts/
+/outputs/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+tokenizer.json
+vocab.json
+merges.txt
+*.raw
+*.mp4
+*.wav

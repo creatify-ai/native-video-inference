@@ -1,0 +1,121 @@
+{
+ "triton_per_fused__fused_rms_norm__to_copy_view_4": {
+  "kwargs": {
+   "XBLOCK": 32
+  },
+  "num_warps": 2
+ },
+ "triton_poi_fused__fused_rms_norm__to_copy_add_arange_cat_cos_div_expand_mul_new_zeros_repeat_slice_stack_sub_unsqueeze_view_7": {
+  "kwargs": {
+   "XBLOCK": 1024
+  },
+  "num_warps": 4
+ },
+ "triton_poi_fused__fused_rms_norm__to_copy_arange_cat_div_expand_mul_neg_new_zeros_repeat_sin_slice_split_stack_sub_unsqueeze_view_6": {
+  "kwargs": {
+   "XBLOCK": 1024
+  },
+  "num_warps": 4
+ },
+ "triton_poi_fused__to_copy_0": {
+  "kwargs": {
+   "XBLOCK": 512
+  },
+  "num_warps": 4
+ },
+ "triton_poi_fused__to_copy_10": {
+  "kwargs": {
+   "XBLOCK": 128
+  },
+  "num_warps": 4
+ },
+ "triton_poi_fused__to_copy_12": {
+  "kwargs": {
+   "XBLOCK": 1024
+  },
+  "num_warps": 4
+ },
+ "triton_poi_fused__to_copy_16": {
+  "kwargs": {
+   "XBLOCK": 1024
+  },
+  "num_warps": 4
+ },
+ "triton_poi_fused__to_copy_17": {
+  "kwargs": {
+   "XBLOCK": 128
+  },
+  "num_warps": 4
+ },
+ "triton_poi_fused__to_copy_2": {
+  "kwargs": {
+   "XBLOCK": 1024
+  },
+  "num_warps": 4
+ },
+ "triton_poi_fused__to_copy_3": {
+  "kwargs": {
+   "XBLOCK": 256
+  },
+  "num_warps": 4
+ },
+ "triton_poi_fused__to_copy_9": {
+  "kwargs": {
+   "XBLOCK": 1024
+  },
+  "num_warps": 4
+ },
+ "triton_poi_fused_arange_cat_div_expand_mul_new_zeros_stack_sub_unsqueeze_view_5": {
+  "kwargs": {
+   "XBLOCK": 256
+  },
+  "num_warps": 4
+ },
+ "triton_poi_fused_clone_permute_slice_view_18": {
+  "kwargs": {
+   "XBLOCK": 1024
+  },
+  "num_warps": 4
+ },
+ "triton_poi_fused_mul_silu_split_view_11": {
+  "kwargs": {
+   "XBLOCK": 1024
+  },
+  "num_warps": 4
+ },
+ "triton_red_fused__fused_rms_norm__to_copy_add_bmm_cat_expand_mul_view_zeros_like_8": {
+  "kwargs": {
+   "XBLOCK": 2,
+   "R0_BLOCK": 512
+  },
+  "num_warps": 8
+ },
+ "triton_red_fused__fused_rms_norm__to_copy_add_bmm_cat_expand_zeros_like_1": {
+  "kwargs": {
+   "XBLOCK": 2,
+   "R0_BLOCK": 512
+  },
+  "num_warps": 8
+ },
+ "triton_red_fused__fused_rms_norm__to_copy_add_mul_view_13": {
+  "kwargs": {
+   "XBLOCK": 2,
+   "R0_BLOCK": 1024
+  },
+  "num_warps": 8
+ },
+ "triton_red_fused__fused_rms_norm__to_copy_add_mul_view_14": {
+  "kwargs": {
+   "XBLOCK": 2,
+   "R0_BLOCK": 1024
+  },
+  "num_warps": 8
+ },
+ "triton_red_fused__to_copy_add_mul_native_layer_norm_view_15": {
+  "kwargs": {
+   "XBLOCK": 2,
+   "R0_BLOCK": 1024
+  },
+  "num_warps": 8
+ }
+}

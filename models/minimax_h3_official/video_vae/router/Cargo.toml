@@ -1,0 +1,12 @@
+[package]
+name = "h3-official-video-vae-router"
+version = "0.1.0"
+edition = "2021"
+publish = false
+autobins = false
+
+[lib]
+path = "lib.rs"
+name = "h3_official_video_vae_router"
+crate-type = ["rlib"]
+

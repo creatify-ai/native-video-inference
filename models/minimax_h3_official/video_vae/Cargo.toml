@@ -1,0 +1,21 @@
+[package]
+name = "h3-official-video-vae"
+version = "0.1.0"
+edition = "2021"
+publish = false
+autobins = false
+
+[dependencies]
+native-core-infra = { path = "../../../core_infra" }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+h3_router = { package = "h3-official-video-vae-router", path = "router" }
+
+
+[[bin]]
+name = "h3-official-video-vae"
+path = "main.rs"
+
+[features]
+default = ["cuda"]
+cuda = ["native-core-infra/cuda"]

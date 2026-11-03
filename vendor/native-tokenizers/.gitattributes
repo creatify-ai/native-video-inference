@@ -1,0 +1,12 @@
+# This is a copied upstream crate, pinned by UPSTREAM.json. Collapse the bulk
+# import in reviews; keep every locally modified file and its patch visible.
+# Add an override whenever another upstream file receives a local change.
+** linguist-vendored=true linguist-generated=true
+.gitattributes linguist-vendored=false linguist-generated=false
+UPSTREAM.json linguist-vendored=false linguist-generated=false
+UPSTREAM_PATCH.diff linguist-vendored=false linguist-generated=false
+LICENSE linguist-generated=false
+Cargo.toml linguist-generated=false
+src/models/unigram/model.rs linguist-generated=false
+src/models/unigram/trie.rs linguist-generated=false
+src/tokenizer/serialization.rs linguist-generated=false

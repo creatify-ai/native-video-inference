@@ -1,0 +1,28 @@
+[package]
+name = "h3-official-audio-vae"
+version = "0.1.0"
+edition = "2021"
+publish = false
+autobins = false
+
+[features]
+default = ["cuda"]
+cuda = ["native-core-infra/cuda"]
+
+[lib]
+path = "lib.rs"
+name = "h3_official_audio_vae"
+
+[[bin]]
+name = "h3-official-audio-infer"
+path = "infer.rs"
+
+[[bin]]
+name = "h3-official-audio-encode"
+path = "encode.rs"
+
+[dependencies]
+native-core-infra = { path = "../../../core_infra" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

@@ -1,0 +1,8 @@
+{
+  "prompt": "A sailboat crosses a quiet lake.",
+  "first_png": "/models/inputs/first.png",
+  "width": 768,
+  "height": 768,
+  "num_frames": 124,
+  "seed": 0
+}

@@ -1,0 +1,27 @@
+[package]
+name = "ltx25-native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+autobins = false
+
+[features]
+default = []
+cuda = ["native-core-infra/model-load"]
+backend = ["cuda"]
+
+[dependencies]
+native-core-infra = { path = "../../core_infra" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "=0.10.9"
+tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"] }
+
+[lib]
+path = "lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "ltx25"
+path = "bin/ltx25.rs"
+required-features = ["cuda"]
