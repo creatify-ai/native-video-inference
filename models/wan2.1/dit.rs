@@ -54,7 +54,7 @@ extern "C" {
     fn wan_square_mean_bf16(x: *const c_void, out: *mut c_void, rows: i64, cols: i64, stream: Stream) -> c_int;
     fn wan_square_mean_warp_rows(x: *const c_void, rows: i64, cols: i64, factor: *mut f32) -> c_int;
     fn w21_rms_rows(x: *const c_void, weight: *const c_void, freqs: *const c_void, out: *mut c_void, rows: i64, f: c_int, h: c_int,
-                    w: c_int, eps: f32, factor: f32, s: Stream) -> c_int;
+                    w: c_int, eps: f32, factor: f32, first: i64, s: Stream) -> c_int;
     fn wan_gelu_erf(x: *const c_void, y: *mut c_void, rows: i64, cols: i64, in_stride: i64, dtype: c_int, stream: Stream) -> c_int;
 }
 fn p(a: u64) -> *mut c_void { a as *mut c_void }
@@ -88,10 +88,18 @@ fn bshd(rows: usize) -> View {
     View { dims: [1, h, rows as i64, d], strides: [h * d, d, row, 1], offset_bytes: 0 }
 }
 
-/// Plans for the grid's three attention shapes (self, image, text): the largest workspace.
+static SPLIT_PLANS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Two GPUs split block 0's self-attention in halves (`AttnSplit`): plan those shapes with the others.
+pub fn plan_attention_split() { SPLIT_PLANS.store(true, std::sync::atomic::Ordering::Relaxed); }
+
+/// Plans for the grid's three attention shapes (self, image, text), and the self-attention halves
+/// when two GPUs split it: the largest workspace.
 fn attention_plans(grid: Grid) -> Result<usize> {
     let s = grid.tokens();
-    Ok([(s, s), (s, CLIP_TOKENS), (s, TEXT_LEN)].iter()
+    let halves: &[(usize, usize)] = if SPLIT_PLANS.load(std::sync::atomic::Ordering::Relaxed) {
+        &[(s / 2, s), (s - s / 2, s), (s / 2, CLIP_TOKENS), (s - s / 2, CLIP_TOKENS)]
+    } else { &[] };
+    Ok([(s, s), (s, CLIP_TOKENS), (s, TEXT_LEN)].iter().chain(halves)
         .map(|&(q, k)| sdpa::prepare(Io::Bf16, &bshd(q), &bshd(k), &bshd(k)).map(|p| p.workspace))
         .collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0))
 }
@@ -110,6 +118,55 @@ pub struct PassContext {
     k: Vec<Buffer>, v: Vec<Buffer>, k_img: Vec<Buffer>, v_img: Vec<Buffer>,
 }
 
+/// The two CFG passes of a step read the same latent, timestep, image and CLIP features, so they
+/// agree up to block 0's text cross-attention. A `Prefix` keeps that point of the first pass for
+/// the second: the residual after the self-attention, the cross-attention's normalized queries and
+/// its image attention.
+pub struct Prefix { x1: Buffer, qn: Buffer, img: Buffer }
+impl Prefix {
+    pub fn new(grid: Grid) -> Result<Self> {
+        let n = grid.tokens() * DIM;
+        Ok(Self { x1: Buffer::new(n * 4)?, qn: Buffer::new(n * 2)?, img: Buffer::new(n * 2)? })
+    }
+}
+/// What a forward does with a `Prefix`: fill it, or start from it instead of recomputing it.
+#[derive(Clone, Copy)]
+pub enum Share<'a> { None, Store(&'a Prefix), Reuse(&'a Prefix) }
+
+/// Two-party meeting point of the two GPUs' forwards (std's Barrier, with a timeout so that one
+/// GPU's failure does not hang the other).
+pub struct Rendezvous { state: std::sync::Mutex<(u64, usize)>, arrived: std::sync::Condvar }
+impl Default for Rendezvous {
+    fn default() -> Self { Self { state: std::sync::Mutex::new((0, 0)), arrived: std::sync::Condvar::new() } }
+}
+impl Rendezvous {
+    pub fn meet(&self) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| "Wan rendezvous poisoned")?;
+        let generation = state.0;
+        state.1 += 1;
+        if state.1 == 2 {
+            *state = (generation + 1, 0);
+            self.arrived.notify_all();
+            return Ok(());
+        }
+        let (state, wait) = self.arrived.wait_timeout_while(state, std::time::Duration::from_secs(300), |s| s.0 == generation)
+            .map_err(|_| "Wan rendezvous poisoned")?;
+        drop(state);
+        if wait.timed_out() { return Err("the other GPU's forward did not reach block 0's attention".into()); }
+        Ok(())
+    }
+}
+/// Block 0's shared part split between the two GPUs of a CFG step: this GPU computes token rows
+/// `rows` of everything from norm1 to the image cross-attention (each a per-row operation, and
+/// cuDNN's attention plans compute every query row of a range as the whole sequence's do). It sends
+/// its keys and values to the other GPU (`peer`: the other's k, v, x, qn and image-attention
+/// buffers on `peer_device`) and records `sent[0]`, waits for the other's (`peer_sent[0]`), then
+/// sends its residual, normalized queries and image attention (`sent[1]`, `peer_sent[1]`).
+pub struct AttnSplit {
+    pub rows: (usize, usize), pub device: i32, pub peer_device: i32, pub peer: [u64; 5],
+    pub sent: [crate::cuda::Event; 2], pub peer_sent: [crate::cuda::Event; 2], pub meet: std::sync::Arc<Rendezvous>,
+}
+
 pub struct Dit<'d> {
     pub device: &'d Device,
     pub grid: Grid,
@@ -124,6 +181,9 @@ pub struct Dit<'d> {
     pub debug: Option<[Buffer; 2]>,
     /// Seconds into `load_from` at which each setup stage finished (startup diagnostics).
     pub setup: Vec<(&'static str, f64)>,
+    split: Option<AttnSplit>,
+    /// (e, e0) by timestep (fp32 [7, 5120]), so a repeated schedule's embeddings are copies.
+    times: std::cell::RefCell<std::collections::HashMap<i64, Buffer>>,
 }
 
 /// Activation buffers of one forward (sized for the grid, reused across blocks and steps).
@@ -196,11 +256,32 @@ impl<'d> Dit<'d> {
         mark("sdpa_plans")?;
         let sc = Scratch::new(grid)?;
         mark("scratch")?;
-        Ok(Self { device, grid, linear, conv, bf16, f32, freqs, ws, sc, debug: None, setup })
+        Ok(Self { device, grid, linear, conv, bf16, f32, freqs, ws, sc, debug: None, setup, split: None,
+                  times: Default::default() })
+    }
+    /// Splits block 0's self-attention with the other GPU (`None` computes all of it). Builds the
+    /// range's plan and grows the workspace if it needs more.
+    pub fn set_split(&mut self, split: Option<AttnSplit>) -> Result<()> {
+        if let Some(sp) = &split {
+            let s = self.grid.tokens();
+            if sp.rows.0 >= sp.rows.1 || sp.rows.1 > s { return Err("Wan attention split rows outside the sequence".into()); }
+            let r = sp.rows.1 - sp.rows.0;
+            let need = sdpa::prepare(Io::Bf16, &bshd(r), &bshd(s), &bshd(s))?.workspace
+                .max(sdpa::prepare(Io::Bf16, &bshd(r), &bshd(CLIP_TOKENS), &bshd(CLIP_TOKENS))?.workspace);
+            if need > self.ws.as_ref().map_or(0, |w| w.bytes()) { self.ws = Some(Buffer::new(need)?); }
+        }
+        self.split = split;
+        Ok(())
+    }
+    /// The buffers the other GPU of a split writes its rows of: k, v, x, qn, image attention.
+    pub fn split_buffers(&self) -> [u64; 5] {
+        let sc = &self.sc;
+        [sc.kr.dev(), sc.v.dev(), sc.x.dev(), sc.qn.dev(), sc.img.dev()]
     }
     /// Re-sizes the activation buffers and the attention workspace for another latent grid.
     pub fn set_grid(&mut self, grid: Grid) -> Result<()> {
         if grid == self.grid { return Ok(()); }
+        self.split = None;
         self.ws = None;
         self.sc = Scratch::new(grid)?;
         self.ws = attention_workspace(grid)?;
@@ -247,8 +328,8 @@ impl<'d> Dit<'d> {
     /// of the fp32 square, squared at the load.
     fn rms(&self, x: u64, weight: &str, out: u64, rows: usize) -> Result<()> {
         if let Some(factor) = warp_rows(x, rows) {
-            return check(unsafe { w21_rms_rows(p(x), p(self.b(weight)), p(0), p(out), rows as i64, 0, 0, 0, EPS, factor, self.s()) },
-                         "rms rows");
+            return check(unsafe { w21_rms_rows(p(x), p(self.b(weight)), p(0), p(out), rows as i64, 0, 0, 0, EPS, factor, 0,
+                                               self.s()) }, "rms rows");
         }
         check(unsafe { wan_square_mean_bf16(p(x), p(self.sc.mean.dev()), rows as i64, DIM as i64, self.s()) }, "rms mean")?;
         check(unsafe { w21_rms_apply(p(x), p(self.sc.mean.dev()), p(self.b(weight)), p(out), rows as i64, DIM as i64, EPS,
@@ -259,11 +340,59 @@ impl<'d> Dit<'d> {
     fn rms_rope(&self, x: u64, weight: &str, out: u64, rows: usize, (fr, hh, ww): (usize, usize, usize)) -> Result<()> {
         if let Some(factor) = warp_rows(x, rows) {
             return check(unsafe { w21_rms_rows(p(x), p(self.b(weight)), p(self.freqs.dev()), p(out), rows as i64, fr as c_int,
-                                               hh as c_int, ww as c_int, EPS, factor, self.s()) }, "rms rope rows");
+                                               hh as c_int, ww as c_int, EPS, factor, 0, self.s()) }, "rms rope rows");
         }
         check(unsafe { wan_square_mean_bf16(p(x), p(self.sc.mean.dev()), rows as i64, DIM as i64, self.s()) }, "rms mean")?;
         check(unsafe { w21_rms_rope(p(x), p(self.sc.mean.dev()), p(self.b(weight)), p(self.freqs.dev()), p(out), HEADS as c_int,
                                     fr as c_int, hh as c_int, ww as c_int, EPS, self.s()) }, "rms rope")
+    }
+    /// `rms_rope` of `rows` token rows starting at token `first` (the warp-per-row form only).
+    fn rms_rope_rows(&self, x: u64, weight: &str, out: u64, rows: usize, first: usize) -> Result<()> {
+        let g = self.grid;
+        let factor = warp_rows(x, rows).ok_or("Wan split rows need the warp-per-row square mean")?;
+        check(unsafe { w21_rms_rows(p(x), p(self.b(weight)), p(self.freqs.dev()), p(out), rows as i64, g.frames as c_int,
+                                    (g.height / 2) as c_int, (g.width / 2) as c_int, EPS, factor, first as i64, self.s()) },
+              "rms rope rows")
+    }
+    /// Block 0 from norm1 to the image cross-attention for this GPU's rows of an `AttnSplit`, with the
+    /// other GPU's rows exchanged: afterwards x, qn and the image attention hold every row, as the
+    /// unsplit block leaves them. `e`: the block's modulation rows 0, 1 and 2.
+    fn block0_split(&self, sp: &AttnSplit, x_in: u64, e: [u64; 3], ctx: &PassContext) -> Result<()> {
+        let (st, sc, s) = (self.s(), &self.sc, self.grid.tokens());
+        let (r0, r1) = sp.rows;
+        let rows = r1 - r0;
+        let (o2, o4, b2) = ((r0 * DIM * 2) as u64, (r0 * DIM * 4) as u64, rows * DIM * 2);
+        let w = |n: &str| block_param(0, n);
+        let send = |to: u64, from: u64, bytes: usize| check(unsafe {
+            crate::cuda::memcpy_peer(to, sp.peer_device, from, sp.device, bytes, st) }, "block 0 rows to the other GPU");
+        let exchange = |k: usize| -> Result<()> {
+            sp.sent[k].record(st)?;
+            // Both GPUs have recorded this step's `sent[k]` before either waits on the other's.
+            sp.meet.meet()?;
+            sp.peer_sent[k].wait_on(st)
+        };
+        self.ln(LnMode::Modulate, In::Bf16, x_in + o2, 0, 0, e[0], e[1], sc.xm.dev() + o2, rows, EPS, true)?;
+        for (name, out) in [("self_attn.q", sc.q.dev()), ("self_attn.k", sc.k.dev()), ("self_attn.v", sc.v.dev())] {
+            self.lin(sc.xm.dev() + o2, &w(name), out + o2, rows, DIM, DIM)?;
+        }
+        self.rms_rope_rows(sc.q.dev() + o2, &w("self_attn.norm_q.weight"), sc.qr.dev() + o2, rows, r0)?;
+        self.rms_rope_rows(sc.k.dev() + o2, &w("self_attn.norm_k.weight"), sc.kr.dev() + o2, rows, r0)?;
+        send(sp.peer[0] + o2, sc.kr.dev() + o2, b2)?;
+        send(sp.peer[1] + o2, sc.v.dev() + o2, b2)?;
+        exchange(0)?;
+        self.attention(sc.qr.dev() + o2, sc.kr.dev(), sc.v.dev(), sc.attn.dev() + o2, rows, s)?;
+        self.lin(sc.attn.dev() + o2, &w("self_attn.o"), sc.y.dev() + o2, rows, DIM, DIM)?;
+        check(unsafe { w21_residual_gate(p(x_in + o2), 1, p(sc.y.dev() + o2), p(e[2]), p(sc.x.dev() + o4), rows as i64,
+                                         DIM as i64, st) }, "residual self")?;
+        self.ln(LnMode::AffineBf16, In::F32, sc.x.dev() + o4, self.f(&w("norm3.weight")), self.f(&w("norm3.bias")), 0, 0,
+                sc.xm.dev() + o2, rows, EPS, false)?;
+        self.lin(sc.xm.dev() + o2, &w("cross_attn.q"), sc.q.dev() + o2, rows, DIM, DIM)?;
+        self.rms(sc.q.dev() + o2, &w("cross_attn.norm_q.weight"), sc.qn.dev() + o2, rows)?;
+        self.attention(sc.qn.dev() + o2, ctx.k_img[0].dev(), ctx.v_img[0].dev(), sc.img.dev() + o2, rows, CLIP_TOKENS)?;
+        send(sp.peer[2] + o4, sc.x.dev() + o4, rows * DIM * 4)?;
+        send(sp.peer[3] + o2, sc.qn.dev() + o2, b2)?;
+        send(sp.peer[4] + o2, sc.img.dev() + o2, b2)?;
+        exchange(1)
     }
     fn attention(&self, q: u64, k: u64, v: u64, out: u64, q_rows: usize, kv_rows: usize) -> Result<()> {
         let scale = sdpa::default_scale(HEAD_DIM as i64);
@@ -315,8 +444,23 @@ impl<'d> Dit<'d> {
         Ok(PassContext { text, image_f32, k, v, k_img, v_img })
     }
 
-    /// e (fp32 [5120]) and e0 (fp32 [6, 5120]) of timestep `t` (the scheduler's int64 timestep).
+    /// e (fp32 [5120]) and e0 (fp32 [6, 5120]) of timestep `t` (the scheduler's int64 timestep):
+    /// stream-ordered copies of the ones computed for `t` before, else computed (and kept).
     pub fn time(&self, t: i64) -> Result<()> {
+        let (st, sc) = (self.s(), &self.sc);
+        let (e, e0) = (DIM * 4, 6 * DIM * 4);
+        if let Some(kept) = self.times.borrow().get(&t) {
+            check(unsafe { crate::cuda::memcpy_d2d(sc.e.dev(), kept.dev(), e, st) }, "kept e")?;
+            return check(unsafe { crate::cuda::memcpy_d2d(sc.e0.dev(), kept.dev() + e as u64, e0, st) }, "kept e0");
+        }
+        self.time_compute(t)?;
+        let kept = Buffer::new(e + e0)?;
+        check(unsafe { crate::cuda::memcpy_d2d(kept.dev(), sc.e.dev(), e, st) }, "keep e")?;
+        check(unsafe { crate::cuda::memcpy_d2d(kept.dev() + e as u64, sc.e0.dev(), e0, st) }, "keep e0")?;
+        self.times.borrow_mut().insert(t, kept);
+        Ok(())
+    }
+    fn time_compute(&self, t: i64) -> Result<()> {
         let (st, sc) = (self.s(), &self.sc);
         upload_into(&sc.t_dev, &t.to_le_bytes(), self.device)?;
         check(unsafe { w21_sinusoidal(p(sc.t_dev.dev()), p(sc.sinus.dev()), FREQ_DIM as c_int, st) }, "sinusoidal")?;
@@ -331,24 +475,33 @@ impl<'d> Dit<'d> {
     /// have run for this step. Returns the fp32 prediction [16, F, H, W] in `out`.
     pub fn forward(&self, latent: u64, y: u64, ctx: &PassContext, out: u64, observe: &mut dyn FnMut(&str, u64) -> Result<()>)
                    -> Result<()> {
+        self.forward_with(latent, y, ctx, out, observe, Share::None)
+    }
+    /// `forward` that fills or starts from a CFG step's shared `Prefix` (`share`); a reused prefix
+    /// must come from this step's other pass.
+    pub fn forward_with(&self, latent: u64, y: u64, ctx: &PassContext, out: u64,
+                        observe: &mut dyn FnMut(&str, u64) -> Result<()>, share: Share) -> Result<()> {
         let (st, sc, g) = (self.s(), &self.sc, self.grid);
         native_core_infra::execution_start::arm();
         native_core_infra::execution_start::enqueue_if_armed(st)?;
         let s = g.tokens();
         let (fr, hh, ww) = (g.frames, g.height / 2, g.width / 2);
-        // Patch embedding: bf16(cat([x, y])) -> Conv3d(36 -> 5120, 1x2x2) -> + bias -> tokens.
-        check(unsafe { w21_cat_cast_bf16(p(latent), p(y), p(sc.x_in.dev()), g.latent_elements(OUT_CHANNELS) as i64,
-                                         g.latent_elements(IN_CHANNELS - OUT_CHANNELS) as i64, st) }, "patch input")?;
-        let input = [1, IN_CHANNELS as i64, fr as i64, g.height as i64, g.width as i64];
-        let weight = [DIM as i64, IN_CHANNELS as i64, 1, 2, 2];
-        let output = [1, DIM as i64, fr as i64, hh as i64, ww as i64];
-        let spec = ConvSpec { ndim: 5, dtype: 2, transposed: 0, allow_tf32: 1, deterministic: 1, channels_last: 0,
-            input_dims: input, input_strides: contiguous(&input), weight_dims: weight, weight_strides: contiguous(&weight),
-            output_dims: output, output_strides: contiguous(&output), padding: [0; 3], stride: [1, 2, 2], dilation: [1; 3] };
-        self.conv.forward(&spec, sc.x_in.dev(), self.b("patch_embedding.weight"), sc.conv.dev(), st)?;
-        eager::add_channel_bias_bf16(sc.conv.dev(), self.b("patch_embedding.bias"), DIM, s, st)?;
-        eager::transpose_bf16(sc.conv.dev(), sc.tokens.dev(), DIM, s, st)?;
-        observe("patch_embedding/out", sc.conv.dev())?;
+        let reuse = if let Share::Reuse(prefix) = share { Some(prefix) } else { None };
+        if reuse.is_none() {
+            // Patch embedding: bf16(cat([x, y])) -> Conv3d(36 -> 5120, 1x2x2) -> + bias -> tokens.
+            check(unsafe { w21_cat_cast_bf16(p(latent), p(y), p(sc.x_in.dev()), g.latent_elements(OUT_CHANNELS) as i64,
+                                             g.latent_elements(IN_CHANNELS - OUT_CHANNELS) as i64, st) }, "patch input")?;
+            let input = [1, IN_CHANNELS as i64, fr as i64, g.height as i64, g.width as i64];
+            let weight = [DIM as i64, IN_CHANNELS as i64, 1, 2, 2];
+            let output = [1, DIM as i64, fr as i64, hh as i64, ww as i64];
+            let spec = ConvSpec { ndim: 5, dtype: 2, transposed: 0, allow_tf32: 1, deterministic: 1, channels_last: 0,
+                input_dims: input, input_strides: contiguous(&input), weight_dims: weight, weight_strides: contiguous(&weight),
+                output_dims: output, output_strides: contiguous(&output), padding: [0; 3], stride: [1, 2, 2], dilation: [1; 3] };
+            self.conv.forward(&spec, sc.x_in.dev(), self.b("patch_embedding.weight"), sc.conv.dev(), st)?;
+            eager::add_channel_bias_bf16(sc.conv.dev(), self.b("patch_embedding.bias"), DIM, s, st)?;
+            eager::transpose_bf16(sc.conv.dev(), sc.tokens.dev(), DIM, s, st)?;
+            observe("patch_embedding/out", sc.conv.dev())?;
+        }
         let row4 = (DIM * 4) as u64;
         // Block i's six modulation rows; blocks alternate between two buffers so that block i + 1's
         // are ready when block i's FFN residual is fused with block i + 1's norm1.
@@ -363,60 +516,75 @@ impl<'d> Dit<'d> {
             let (x_in, x_bf16) = if i == 0 { (sc.tokens.dev(), true) } else { (sc.x.dev(), false) };
             let eb = e_bufs[i % 2];
             let e = |k: u64| eb + k * row4;
-            // Self-attention.
             let mut b0 = |name: &str, addr: u64| if i == 0 { observe(&format!("b0/{name}"), addr) } else { Ok(()) };
-            // norm1: block 0's here; a later block's was written by the previous block's FFN residual.
-            if i == 0 {
-                self.ln(LnMode::Modulate, In::Bf16, x_in, 0, 0, e(0), e(1), sc.xm.dev(), s, EPS, x_bf16)?;
-            }
-            b0("xm_self", sc.xm.dev())?;
-            self.lin(sc.xm.dev(), &w("self_attn.q"), sc.q.dev(), s, DIM, DIM)?;
-            self.lin(sc.xm.dev(), &w("self_attn.k"), sc.k.dev(), s, DIM, DIM)?;
-            self.lin(sc.xm.dev(), &w("self_attn.v"), sc.v.dev(), s, DIM, DIM)?;
-            b0("q", sc.q.dev())?;
-            b0("k", sc.k.dev())?;
-            b0("v", sc.v.dev())?;
-            if i == 0 {
-                // Block 0 keeps every intermediate observable.
-                self.rms(sc.q.dev(), &w("self_attn.norm_q.weight"), sc.qn.dev(), s)?;
-                self.rms(sc.k.dev(), &w("self_attn.norm_k.weight"), sc.kn.dev(), s)?;
-                b0("qn", sc.qn.dev())?;
-                b0("kn", sc.kn.dev())?;
-                let dbg = |k: usize| self.debug.as_ref().map_or(0, |d| d[k].dev());
-                check(unsafe { w21_rope(p(sc.qn.dev()), p(self.freqs.dev()), p(sc.qr.dev()), p(dbg(0)), HEADS as c_int,
-                                        fr as c_int, hh as c_int, ww as c_int, st) }, "rope q")?;
-                check(unsafe { w21_rope(p(sc.kn.dev()), p(self.freqs.dev()), p(sc.kr.dev()), p(dbg(1)), HEADS as c_int,
-                                        fr as c_int, hh as c_int, ww as c_int, st) }, "rope k")?;
-                if dbg(0) != 0 { b0("qr_f32", dbg(0))?; b0("kr_f32", dbg(1))?; }
+            // Block 0's cross-attention queries and image attention (the shared prefix's when reused).
+            let (mut qn, mut img) = (sc.qn.dev(), sc.img.dev());
+            if let (0, Some(prefix)) = (i, reuse) {
+                check(unsafe { crate::cuda::memcpy_d2d(sc.x.dev(), prefix.x1.dev(), s * DIM * 4, st) }, "prefix residual")?;
+                (qn, img) = (prefix.qn.dev(), prefix.img.dev());
+            } else if let (0, Some(sp)) = (i, &self.split) {
+                self.block0_split(sp, x_in, [e(0), e(1), e(2)], ctx)?;
             } else {
-                self.rms_rope(sc.q.dev(), &w("self_attn.norm_q.weight"), sc.qr.dev(), s, (fr, hh, ww))?;
-                self.rms_rope(sc.k.dev(), &w("self_attn.norm_k.weight"), sc.kr.dev(), s, (fr, hh, ww))?;
+                // Self-attention.
+                // norm1: block 0's here; a later block's was written by the previous block's FFN residual.
+                if i == 0 {
+                    self.ln(LnMode::Modulate, In::Bf16, x_in, 0, 0, e(0), e(1), sc.xm.dev(), s, EPS, x_bf16)?;
+                }
+                b0("xm_self", sc.xm.dev())?;
+                self.lin(sc.xm.dev(), &w("self_attn.q"), sc.q.dev(), s, DIM, DIM)?;
+                self.lin(sc.xm.dev(), &w("self_attn.k"), sc.k.dev(), s, DIM, DIM)?;
+                self.lin(sc.xm.dev(), &w("self_attn.v"), sc.v.dev(), s, DIM, DIM)?;
+                b0("q", sc.q.dev())?;
+                b0("k", sc.k.dev())?;
+                b0("v", sc.v.dev())?;
+                if i == 0 && self.debug.is_some() {
+                    // Block 0 keeps every intermediate observable for the fixture comparison.
+                    self.rms(sc.q.dev(), &w("self_attn.norm_q.weight"), sc.qn.dev(), s)?;
+                    self.rms(sc.k.dev(), &w("self_attn.norm_k.weight"), sc.kn.dev(), s)?;
+                    b0("qn", sc.qn.dev())?;
+                    b0("kn", sc.kn.dev())?;
+                    let dbg = |k: usize| self.debug.as_ref().map_or(0, |d| d[k].dev());
+                    check(unsafe { w21_rope(p(sc.qn.dev()), p(self.freqs.dev()), p(sc.qr.dev()), p(dbg(0)), HEADS as c_int,
+                                            fr as c_int, hh as c_int, ww as c_int, st) }, "rope q")?;
+                    check(unsafe { w21_rope(p(sc.kn.dev()), p(self.freqs.dev()), p(sc.kr.dev()), p(dbg(1)), HEADS as c_int,
+                                            fr as c_int, hh as c_int, ww as c_int, st) }, "rope k")?;
+                    if dbg(0) != 0 { b0("qr_f32", dbg(0))?; b0("kr_f32", dbg(1))?; }
+                } else {
+                    self.rms_rope(sc.q.dev(), &w("self_attn.norm_q.weight"), sc.qr.dev(), s, (fr, hh, ww))?;
+                    self.rms_rope(sc.k.dev(), &w("self_attn.norm_k.weight"), sc.kr.dev(), s, (fr, hh, ww))?;
+                }
+                self.attention(sc.qr.dev(), sc.kr.dev(), sc.v.dev(), sc.attn.dev(), s, s)?;
+                b0("attn", sc.attn.dev())?;
+                self.lin(sc.attn.dev(), &w("self_attn.o"), sc.y.dev(), s, DIM, DIM)?;
+                b0("o", sc.y.dev())?;
+                // Cross-attention (image keys first, then text), norm3 affine.
+                if i == 0 {
+                    check(unsafe { w21_residual_gate(p(x_in), c_int::from(x_bf16), p(sc.y.dev()), p(e(2)), p(sc.x.dev()), s as i64,
+                                                     DIM as i64, st) }, "residual self")?;
+                    b0("x1", sc.x.dev())?;
+                    self.ln(LnMode::AffineBf16, In::F32, sc.x.dev(), self.f(&w("norm3.weight")), self.f(&w("norm3.bias")), 0, 0,
+                            sc.xm.dev(), s, EPS, false)?;
+                    b0("xm_cross", sc.xm.dev())?;
+                } else {
+                    self.residual_ln(LnMode::AffineBf16, Some(e(2)), sc.y.dev(), self.f(&w("norm3.weight")), self.f(&w("norm3.bias")),
+                                     0, 0, s)?;
+                }
+                self.lin(sc.xm.dev(), &w("cross_attn.q"), sc.q.dev(), s, DIM, DIM)?;
+                b0("cq", sc.q.dev())?;
+                self.rms(sc.q.dev(), &w("cross_attn.norm_q.weight"), sc.qn.dev(), s)?;
+                b0("cqn", sc.qn.dev())?;
+                self.attention(sc.qn.dev(), ctx.k_img[i].dev(), ctx.v_img[i].dev(), sc.img.dev(), s, CLIP_TOKENS)?;
+                if let (0, Share::Store(prefix)) = (i, share) {
+                    for (dst, src, bytes) in [(prefix.x1.dev(), sc.x.dev(), s * DIM * 4), (prefix.qn.dev(), sc.qn.dev(), s * DIM * 2),
+                                              (prefix.img.dev(), sc.img.dev(), s * DIM * 2)] {
+                        check(unsafe { crate::cuda::memcpy_d2d(dst, src, bytes, st) }, "prefix copy")?;
+                    }
+                }
             }
-            self.attention(sc.qr.dev(), sc.kr.dev(), sc.v.dev(), sc.attn.dev(), s, s)?;
-            b0("attn", sc.attn.dev())?;
-            self.lin(sc.attn.dev(), &w("self_attn.o"), sc.y.dev(), s, DIM, DIM)?;
-            b0("o", sc.y.dev())?;
-            // Cross-attention (image keys first, then text), norm3 affine.
-            if i == 0 {
-                check(unsafe { w21_residual_gate(p(x_in), c_int::from(x_bf16), p(sc.y.dev()), p(e(2)), p(sc.x.dev()), s as i64,
-                                                 DIM as i64, st) }, "residual self")?;
-                b0("x1", sc.x.dev())?;
-                self.ln(LnMode::AffineBf16, In::F32, sc.x.dev(), self.f(&w("norm3.weight")), self.f(&w("norm3.bias")), 0, 0,
-                        sc.xm.dev(), s, EPS, false)?;
-                b0("xm_cross", sc.xm.dev())?;
-            } else {
-                self.residual_ln(LnMode::AffineBf16, Some(e(2)), sc.y.dev(), self.f(&w("norm3.weight")), self.f(&w("norm3.bias")),
-                                 0, 0, s)?;
-            }
-            self.lin(sc.xm.dev(), &w("cross_attn.q"), sc.q.dev(), s, DIM, DIM)?;
-            b0("cq", sc.q.dev())?;
-            self.rms(sc.q.dev(), &w("cross_attn.norm_q.weight"), sc.qn.dev(), s)?;
-            b0("cqn", sc.qn.dev())?;
-            self.attention(sc.qn.dev(), ctx.k_img[i].dev(), ctx.v_img[i].dev(), sc.img.dev(), s, CLIP_TOKENS)?;
-            self.attention(sc.qn.dev(), ctx.k[i].dev(), ctx.v[i].dev(), sc.txt.dev(), s, TEXT_LEN)?;
-            b0("img", sc.img.dev())?;
+            self.attention(qn, ctx.k[i].dev(), ctx.v[i].dev(), sc.txt.dev(), s, TEXT_LEN)?;
+            b0("img", img)?;
             b0("txt", sc.txt.dev())?;
-            eager::add_bf16(sc.txt.dev(), sc.img.dev(), sc.sum.dev(), s * DIM, st)?;
+            eager::add_bf16(sc.txt.dev(), img, sc.sum.dev(), s * DIM, st)?;
             b0("sum", sc.sum.dev())?;
             self.lin(sc.sum.dev(), &w("cross_attn.o"), sc.y.dev(), s, DIM, DIM)?;
             b0("co", sc.y.dev())?;

@@ -13,9 +13,10 @@ every guidance and UniPC step and the final latent. The decoded video is identic
 repeated runs are identical. The validation inputs and the reference recorder are not part of this
 repository. MP4 bytes also depend on your `ffmpeg` build; the claim covers the decoded frames.
 
-Warm, on one B200, the official example's request (832x1104, 81 frames, 40 steps) takes 400–403 s
-natively: 397–400 s for the 80 DiT forwards, 3.2 s for the VAE decode. On two B200s it takes 204 s,
-with the unconditional pass of classifier-free guidance on the second GPU (40 steps in 201 s). A
+Warm, on one B200, the official example's request (832x1104, 81 frames, 40 steps) takes 390–401 s
+natively, depending on the host: 387–398 s for the 80 DiT forwards, 3.2 s for the VAE decode. On two
+B200s it takes 204 s, with the unconditional pass of classifier-free guidance on the second GPU
+(40 steps in 201 s). A
 server reuses the last request's text, image and VAE conditioning when the next request repeats its
 prompts, image and size (2–3 s otherwise). Speed comes from the access pattern, never the arithmetic:
 vectorized and fused elementwise, normalization and RoPE kernels that keep every per-element
@@ -122,6 +123,12 @@ modal run examples/modal/wan21.py --gpus 2   # on a B200:2 container
   `wan21-server`), the second GPU runs every unconditional DiT pass (`cfg_parallel.rs`) and copies
   the DiT weights from the first over the peer link instead of reading them. The official example's
   decoded video is identical to one GPU's; the ten-request parity record above is from one GPU.
+- **Shared work between the two CFG passes.** Both passes of a step read the same latent, timestep,
+  image and CLIP features, so they agree up to block 0's text cross-attention. On one GPU the
+  unconditional pass starts from the conditional pass's state at that point (`dit::Prefix`). On
+  two, the GPUs split block 0's self-attention by query rows and exchange their halves over the
+  peer link (`dit::AttnSplit`); cuDNN computes every row of a range with the whole sequence's plan,
+  so the bytes do not change.
   There is no attention sparsity, step caching or quantization.
 - **Resolution.** The output keeps the input's aspect ratio within `max_area`, and both sides are
   multiples of 16. Parity was recorded at 1280×720, 720×1280, 1264×720, 720×1264, 960×960,

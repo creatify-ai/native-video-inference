@@ -132,26 +132,32 @@ the second of two back-to-back identical requests; both servers then reuse the f
 and image conditioning. The warm column was measured again on 2026-11-02 for native-video-inference
 and SGLang (vLLM-Omni's is from 2026-11-01). A request's time moves by about 2% between B200 hosts,
 more than the gap between the two, so the comparison below runs both in one container: SGLang's
-server for two requests, then `wan21-generate --repeat 2` (two requests in one process), in
-alternating rounds on two B200s:
+server for two requests, then `wan21-generate --repeat 2` (two requests in one process), in two
+alternating rounds per GPU count:
 
-| One container | native-video-inference | SGLang 0.5.22 |
+| One container, warm request | native-video-inference | SGLang 0.5.22 |
 | --- | ---: | ---: |
-| One B200: first / warm request | 405.5–406.5 / 400.1–400.3 s | 406.2 / 403.2–404.2 s |
-| One B200: the 40 steps | 396.9–397.1 s | 396.7–397.4 s |
-| Two B200s: first / warm request | 206.8–208.3 / 204.0–204.1 s | 207.6 / 207.6 s |
-| Two B200s: the 40 steps | 200.8–201.1 s | 198.6–198.7 s |
+| One B200: request | 390.3–390.4 s | 398.2 s |
+| One B200: the 40 steps | 387.1–387.2 s | 391.3–391.4 s |
+| Two B200s: request | 204.3 s | 209.7–210.7 s |
+| Two B200s: the 40 steps | 200.97–200.99 s | 200.91–201.02 s |
 
 The VAE decode takes 3.2 s natively and 5.4–5.8 s with SGLang. With `--num-gpus 2` SGLang also
-runs the unconditional pass of classifier-free guidance on the second GPU. On two GPUs its steps are
-1.2% faster: about half of that is the host (one GPU took 4.99 s per forward natively in the same
-container), the rest is each step waiting for the slower of the two GPUs. native-video-inference
-reproduces the official pipeline's output byte for byte; SGLang's output differs from it.
+runs the unconditional pass of classifier-free guidance on the second GPU. On one GPU the steps are
+1% faster natively because the unconditional pass starts from the conditional pass's state at
+block 0's text cross-attention (both read the same latent, timestep and image up to there); on two,
+the GPUs split that shared part by rows instead, and a step takes as long as SGLang's. Either way a
+step waits for the slower of the two GPUs, and with both busy the first B200 ran 2–3% slower than the
+second in every container we traced. A first request costs natively about 0.5 s more in its steps
+(work done once per process; SGLang's server runs three warm-up requests before serving).
+native-video-inference reproduces the official pipeline's output byte for byte, on one GPU or two;
+SGLang's output differs from it.
 
-LTX 2.5 (T2V, 1472×832, 49 frames) is compared in its [README](models/ltx25/README.md#performance):
-the final latents are ready 1.8 s after a warm request on one B200, against 2.8 s for SGLang's text
-encoding and two stages on one B200 and 1.9 s on two; with the official diffusion video decoder, a
-request takes about 7–8 s natively and 110–115 s with SGLang.
+LTX 2.5 (T2V, 1472×832, 49 frames) is compared the same way, in one container, in its
+[README](models/ltx25/README.md#performance): a warm request's final latents are ready after
+1.80–1.81 s on one B200 and 1.80–1.85 s on two, against 2.75–2.83 s and 1.93–1.96 s for SGLang's
+text encoding and two stages; with the official diffusion video decoder, a request takes 6.6–7.6 s
+natively and 110–115 s with SGLang.
 
 ## How it is built
 

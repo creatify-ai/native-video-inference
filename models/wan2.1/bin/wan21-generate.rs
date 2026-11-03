@@ -13,14 +13,22 @@
 //!
 //! `--gpus 2` runs every unconditional DiT pass on a second GPU. `--repeat N` serves the request N
 //! times in one process as wan21-server does: later requests reuse the resident models and the first
-//! request's conditioning (same prompts and image).
+//! request's conditioning (same prompts and image). `WAN21_REPORT_SHA=1` prints each decoded video's
+//! SHA-256 (fp32 frames, as wan21-server reports it).
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use wan21_native::cuda::Device;
 use wan21_native::frontend::{prepare_request, Request, NEGATIVE_PROMPT};
-use wan21_native::pipeline::{cold_start_on, generate, generate_request, grid, write_mp4, Marks, Models};
+use wan21_native::pipeline::{cold_start_on, generate, generate_request, grid, write_mp4, Generated, Marks, Models};
 use wan21_native::Result;
 
+
+fn report_sha(generated: &Generated, device: &Device) -> Result<()> {
+    if std::env::var("WAN21_REPORT_SHA").as_deref() == Ok("1") {
+        eprintln!("video sha256 {}", wan21_native::gold::sha256_f32(&generated.video.download_f32(device)?));
+    }
+    Ok(())
+}
 
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -80,6 +88,7 @@ fn run() -> Result<()> {
             front(request.clone(), png.clone(), tokenizer.clone()), &marks, &mut |_, _| Ok(()))?;
         eprintln!("generated {} frames at {}x{} in {:.1}s from process start ({:?})", generated.frames, prepared.width(),
                   prepared.height(), t0.elapsed().as_secs_f64(), generated.timings);
+        report_sha(&generated, device)?;
         write_mp4(&generated, &prepared, device, &out)?;
         models.reuse_conditioning = true;
         for n in 2..=repeat {
@@ -87,6 +96,7 @@ fn run() -> Result<()> {
             let (prepared, generated) = generate_request(&mut models, front(request.clone(), png.clone(), tokenizer.clone()),
                                                          &mut |_, _| Ok(()))?;
             eprintln!("generated request {n} in {:.1}s ({:?})", t.elapsed().as_secs_f64(), generated.timings);
+            report_sha(&generated, device)?;
             write_mp4(&generated, &prepared, device, &out)?;
         }
     } else {
