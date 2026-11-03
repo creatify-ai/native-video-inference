@@ -5,7 +5,7 @@
 //! resident (the reference's offload_model only moves weights between devices).
 use crate::clip::ClipVisual;
 use crate::cuda::{check, memcpy_d2d, upload_into, Buffer, Device};
-use crate::dit::{Dit, Grid};
+use crate::dit::{Dit, Grid, Share};
 use crate::frontend::Prepared;
 use crate::rng::CudaGenerator;
 use crate::sampler::UniPc;
@@ -188,6 +188,7 @@ pub fn cold_start_on(world: usize, prepared_dir: &Path, checkpoint_dir: &Path,
                      -> Result<(&'static Device, Models<'static>, Prepared, Generated)> {
     let _first_dit=native_core_infra::execution_start::Capture::begin();
     if !matches!(world, 1 | 2) { return Err("official Wan runs on one or two GPUs".into()); }
+    if world == 2 { crate::dit::plan_attention_split(); }
     crate::admission::require_backend_preparation()?;
     // Reject absent or changed metadata before starting readers, CPU work or CUDA.
     let declaration = crate::admission::checkpoint(prepared_dir, checkpoint_dir)?;
@@ -376,26 +377,42 @@ pub(crate) fn denoise_with_peer(dit:&mut Dit,device:&Device,prepared:&Prepared,c
     observe("noise/randn0", latent.dev())?;
     let ctx = [dit.pass_context(contexts[0].0.dev(), contexts[0].1, clip_fea.dev())?,
                dit.pass_context(contexts[1].0.dev(), contexts[1].1, clip_fea.dev())?];
-    if let Some(peer)=peer{peer.configure(g,&contexts[1].0,contexts[1].1,clip_fea,y,device)?;}
+    // One GPU: the unconditional pass starts from the conditional pass's block-0 prefix. Two GPUs:
+    // the passes split that prefix by token rows instead.
+    let prefix=if peer.is_none(){Some(crate::dit::Prefix::new(g)?)}else{None};
+    if let Some(peer)=peer{
+        let(sent,meet,first)=(peer.split_events()?,std::sync::Arc::new(crate::dit::Rendezvous::default()),g.tokens()/2);
+        let split=crate::cfg_parallel::Split{bufs:dit.split_buffers(),sent,meet:meet.clone(),first};
+        let(peer_bufs,peer_sent)=peer.configure(g,&contexts[1].0,contexts[1].1,clip_fea,y,device,Some(split))?;
+        dit.set_split(Some(crate::dit::AttnSplit{rows:(0,first),device:0,peer_device:1,peer:peer_bufs,sent,peer_sent,meet}))?;
+    }
+    let share=|pass:usize|match(&prefix,pass){(Some(prefix),0)=>Share::Store(prefix),(Some(prefix),_)=>Share::Reuse(prefix),
+        (None,_)=>Share::None};
     let mut unipc = UniPc::new(r.sample_steps, r.shift, n)?;
     let timesteps = unipc.timesteps.clone();
     let (out_c, out_u, guided) = (Buffer::new(n * 4)?, Buffer::new(n * 4)?, Buffer::new(n * 4)?);
     let (mut cur, mut next) = (latent, Buffer::new(n * 4)?);
-    let t_dev = Buffer::new(8)?;
+    // Every step's timestep embeddings ahead of the loop, and the timesteps on the device in one upload,
+    // so that no step waits for the host.
+    for &t in &timesteps { dit.time(t)?; }
+    let t_dev = Buffer::new(8 * timesteps.len().max(1))?;
+    let bytes: Vec<u8> = timesteps.iter().flat_map(|t| t.to_le_bytes()).collect();
+    upload_into(&t_dev, &bytes, device)?;
     let executed=native_core_infra::switch_benchmark::steps(timesteps.len(),false)?;
     for (step, &t) in timesteps.iter().take(executed).enumerate() {
-        dit.time(t)?;
-        upload_into(&t_dev, &t.to_le_bytes(), device)?;
+        // GPU 1 starts once the latent is ready; the timestep embeddings only need t.
         let mut secondary=peer.map(|peer|peer.forward(cur.dev(),t,out_u.dev(),device)).transpose()?;
+        dit.time(t)?;
+        let t_step = t_dev.dev() + 8 * step as u64;
         for (pass, out) in [&out_c, &out_u].into_iter().enumerate() {
             let f = 2 * step + pass;
             observe(&format!("dit/f{f:04}/in/x"), cur.dev())?;
-            observe(&format!("dit/f{f:04}/in/t"), t_dev.dev())?;
+            observe(&format!("dit/f{f:04}/in/t"), t_step)?;
             observe(&format!("dit/f{f:04}/in/context"), contexts[pass].0.dev())?;
             observe(&format!("dit/f{f:04}/in/clip_fea"), clip_fea.dev())?;
             observe(&format!("dit/f{f:04}/in/y"), y.dev())?;
             if pass==1 && peer.is_some(){secondary.take().ok_or("Wan CFG forward missing")?.finish()?;}
-            else{dit.forward(cur.dev(), y.dev(), &ctx[pass], out.dev(), &mut |_, _| Ok(()))?;}
+            else{dit.forward_with(cur.dev(), y.dev(), &ctx[pass], out.dev(), &mut |_, _| Ok(()), share(pass))?;}
             observe(&format!("dit/f{f:04}/out"), out.dev())?;
         }
         unipc.guidance(out_c.dev(), out_u.dev(), guided.dev(), r.guide_scale, st)?;

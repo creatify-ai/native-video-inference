@@ -2,19 +2,22 @@
 //! each pass keeps the single-GPU operator order and the scheduler stays on GPU 0.
 //! At cold start GPU 1 copies GPU 0's DiT weights over the peer link instead of
 //! reading them again.
-use crate::{cuda::{self,Buffer,Device,Event},dit::{Dit,Grid,PassContext},serving::Session,
+use crate::{cuda::{self,Buffer,Device,Event},dit::{AttnSplit,Dit,Grid,PassContext,Rendezvous},serving::Session,
     weights::DeviceWeights,Result};
 use native_core_infra::{backend_service::Session as ResidentSession,model_load::Loaded};
 use serde_json::{json,Value};
-use std::{cell::OnceCell,path::PathBuf,rc::Rc,sync::mpsc,thread,time::Instant};
+use std::{cell::OnceCell,path::PathBuf,rc::Rc,sync::{mpsc,Arc},thread,time::Instant};
 
 type Reply=mpsc::Sender<std::result::Result<Value,String>>;
 enum Command{
     Warm(PathBuf,Reply),Prefetch(PathBuf,usize,Option<Vec<String>>,Reply),
     Prewarm(Grid,Reply),Replicate(usize,Grid,Reply),
-    Configure(Grid,u64,usize,usize,u64,usize,u64,usize,Reply),
+    Configure(Grid,u64,usize,usize,u64,usize,u64,usize,Option<Split>,Reply),
     Forward(u64,i64,u64,Event,Reply),Retire(Reply),Evict(Reply),Audit(Reply),Status(Reply),Stop,
 }
+/// GPU 0's side of block 0's split: its buffers (`Dit::split_buffers`), its `sent` events, the
+/// rendezvous and the first row GPU 1 computes (GPU 1 takes the rows from there to the end).
+pub(crate) struct Split{pub bufs:[u64;5],pub sent:[Event;2],pub meet:Arc<Rendezvous>,pub first:usize}
 pub(crate) struct Pending{reply:Option<mpsc::Receiver<std::result::Result<Value,String>>>}
 impl Pending{pub(crate) fn finish(mut self)->Result<Value>{self.reply.take().ok_or("Wan peer reply consumed")?
     .recv().map_err(|_|"Wan GPU 1 exited")?.map_err(Into::into)}}
@@ -26,7 +29,7 @@ struct State{
     // Drop views/buffers before their weight owner and CUDA context.
     context:Option<PassContext>,y:Option<Buffer>,latent:Option<Buffer>,out:Option<Buffer>,
     capture:Option<native_core_infra::execution_start::Capture>,first_dit:Option<Value>,
-    session:Session,forwards:usize,
+    session:Session,forwards:usize,sent:Option<[Event;2]>,
 }
 impl State{
     fn copy(&self,address:u64,bytes:usize)->Result<Buffer>{
@@ -35,7 +38,8 @@ impl State{
         Ok(value)
     }
     #[allow(clippy::too_many_arguments)]
-    fn configure(&mut self,grid:Grid,context:u64,context_bytes:usize,rows:usize,clip:u64,clip_bytes:usize,y:u64,y_bytes:usize)->Result<Value>{
+    fn configure(&mut self,grid:Grid,context:u64,context_bytes:usize,rows:usize,clip:u64,clip_bytes:usize,y:u64,y_bytes:usize,
+                 split:Option<Split>)->Result<Value>{
         self.session.device.sync()?;
         self.context.take();self.y.take();self.latent.take();self.out.take();
         self.capture.take();self.first_dit=None;
@@ -45,13 +49,19 @@ impl State{
             self.session.dit=Some(Dit::load_from(&DeviceWeights{loaded,prefix:"dit.".into()},grid,device)?);
         }
         self.session.dit.as_mut().unwrap().set_grid(grid)?;
+        // Recorded on GPU 1's stream, so it is created on GPU 1's thread.
+        if self.sent.is_none(){self.sent=Some([Event::new()?,Event::new()?]);}
+        let sent=self.sent.unwrap();
+        let bufs=self.session.dit.as_ref().unwrap().split_buffers();
+        self.session.dit.as_mut().unwrap().set_split(split.map(|sp|AttnSplit{rows:(sp.first,grid.tokens()),device:1,peer_device:0,
+            peer:sp.bufs,sent,peer_sent:sp.sent,meet:sp.meet}))?;
         let(context,clip)=(self.copy(context,context_bytes)?,self.copy(clip,clip_bytes)?);
         self.context=Some(self.session.dit.as_ref().unwrap().pass_context(context.dev(),rows,clip.dev())?);
         self.y=Some(self.copy(y,y_bytes)?);
         self.latent=Some(Buffer::new(grid.latent_elements(16)*4)?);
         self.out=Some(Buffer::new(grid.latent_elements(16)*4)?);
         self.session.device.sync()?;self.capture=Some(native_core_infra::execution_start::Capture::begin());
-        Ok(json!({"configured":true}))
+        Ok(json!({"configured":true,"bufs":bufs,"sent":[sent[0].0,sent[1].0]}))
     }
     fn replicate(&mut self,source:&Loaded,grid:Grid)->Result<Value>{
         let started=Instant::now();
@@ -66,10 +76,11 @@ impl State{
     }
     fn forward(&mut self,latent:u64,t:i64,out:u64,ready:Event)->Result<Value>{
         let device=&self.session.device;let input=self.latent.as_ref().ok_or("Wan CFG input missing")?;
+        let dit=self.session.dit.as_ref().ok_or("Wan CFG DiT missing")?;
+        // The timestep embeddings need only t, so they run while GPU 0 finishes the latent.
+        dit.time(t)?;
         ready.wait_on(device.stream)?;
         cuda::check(unsafe{cuda::memcpy_peer(input.dev(),1,latent,0,input.bytes(),device.stream)},"Wan CFG latent peer copy")?;
-        let dit=self.session.dit.as_ref().ok_or("Wan CFG DiT missing")?;
-        dit.time(t)?;
         dit.forward(input.dev(),self.y.as_ref().ok_or("Wan CFG y missing")?.dev(),
             self.context.as_ref().ok_or("Wan CFG context missing")?,self.out.as_ref().unwrap().dev(),&mut|_,_|Ok(()))?;
         cuda::check(unsafe{cuda::memcpy_peer(out,0,self.out.as_ref().unwrap().dev(),1,input.bytes(),device.stream)},"Wan CFG prediction peer copy")?;
@@ -83,7 +94,8 @@ impl State{
     fn status(&self)->Result<Value>{let mut value=self.session.metadata()?;value["unconditional_forwards"]=json!(self.forwards);
         value["first_dit_start"]=json!(self.first_dit);Ok(value)}
 }
-pub(crate) struct CfgWorker{sender:mpsc::Sender<Command>,thread:Option<thread::JoinHandle<()>>,ready:OnceCell<Event>}
+pub(crate) struct CfgWorker{sender:mpsc::Sender<Command>,thread:Option<thread::JoinHandle<()>>,ready:OnceCell<Event>,
+    sent:OnceCell<[Event;2]>}
 impl CfgWorker{
     pub(crate) fn open()->Result<Self>{
         cuda::enable_peer_access(1)?;let ready=Event::new()?;
@@ -99,7 +111,7 @@ impl CfgWorker{
         let thread=thread::Builder::new().name("wan21-cfg-gpu1".into()).spawn(move||{
             let run=(||->Result<()>{
                 let session=Session::open_rank(1)?;cuda::enable_peer_access(0)?;
-                let mut state=State{context:None,y:None,latent:None,out:None,capture:None,first_dit:None,session,forwards:0};
+                let mut state=State{context:None,y:None,latent:None,out:None,capture:None,first_dit:None,session,forwards:0,sent:None};
                 let _=boot.send(Ok(()));
                 macro_rules! reply{($sender:expr,$result:expr)=>{{
                     let result=$result.map_err(|e|e.to_string());
@@ -117,8 +129,8 @@ impl CfgWorker{
                     Command::Prewarm(grid,to)=>reply!(to,Dit::prewarm(grid).map(|_|json!({"prewarmed":true}))),
                     // The sender keeps the source allocation alive until this reply.
                     Command::Replicate(source,grid,to)=>reply!(to,state.replicate(unsafe{&*(source as *const Loaded)},grid)),
-                    Command::Configure(grid,context,bytes,rows,clip,clip_bytes,y,y_bytes,to)=>
-                        reply!(to,state.configure(grid,context,bytes,rows,clip,clip_bytes,y,y_bytes)),
+                    Command::Configure(grid,context,bytes,rows,clip,clip_bytes,y,y_bytes,split,to)=>
+                        reply!(to,state.configure(grid,context,bytes,rows,clip,clip_bytes,y,y_bytes,split)),
                     Command::Forward(latent,t,out,ready,to)=>reply!(to,state.forward(latent,t,out,ready)),
                     Command::Retire(to)=>reply!(to,state.release_request().and_then(|_|state.session.retire_predictors())),
                     Command::Evict(to)=>reply!(to,state.release_request().and_then(|_|state.session.evict())),
@@ -128,7 +140,7 @@ impl CfgWorker{
             })();
             if let Err(error)=run{eprintln!("Wan GPU 1: {error}");let _=boot.send(Err(error.to_string()));}
         })?;
-        Ok((Self{sender,thread:Some(thread),ready:OnceCell::new()},started))
+        Ok((Self{sender,thread:Some(thread),ready:OnceCell::new(),sent:OnceCell::new()},started))
     }
     fn begin(&self,command:impl FnOnce(Reply)->Command)->Result<Pending>{
         let(to,reply)=mpsc::channel();self.sender.send(command(to)).map_err(|_|"Wan GPU 1 exited")?;
@@ -145,11 +157,25 @@ impl CfgWorker{
     pub(crate) fn begin_replicate(&self,dit:&Rc<Loaded>,grid:Grid)->Result<Replica>{
         Ok(Replica{pending:self.begin(|to|Command::Replicate(Rc::as_ptr(dit) as usize,grid,to))?,_source:dit.clone()})
     }
-    pub(crate) fn configure(&self,grid:Grid,context:&Buffer,rows:usize,clip:&Buffer,y:&Buffer,device:&Device)->Result<()>{
+    /// GPU 1's pass inputs; with `split`, also block 0's split. Returns GPU 1's split buffers and
+    /// `sent` events.
+    pub(crate) fn configure(&self,grid:Grid,context:&Buffer,rows:usize,clip:&Buffer,y:&Buffer,device:&Device,
+                            split:Option<Split>)->Result<([u64;5],[Event;2])>{
         // Recorded on GPU 0's stream, so it is created on GPU 0's thread.
         if self.ready.get().is_none(){self.ready.set(Event::new()?).map_err(|_|"Wan GPU 1 event set twice")?;}
         device.sync()?;
-        self.begin(|to|Command::Configure(grid,context.dev(),context.bytes(),rows,clip.dev(),clip.bytes(),y.dev(),y.bytes(),to))?.finish()?;Ok(())
+        let reply=self.begin(|to|Command::Configure(grid,context.dev(),context.bytes(),rows,clip.dev(),clip.bytes(),y.dev(),y.bytes(),
+            split,to))?.finish()?;
+        let bufs=reply["bufs"].as_array().ok_or("Wan GPU 1 split buffers")?.iter().map(|b|b.as_u64().ok_or("Wan GPU 1 split buffer"))
+            .collect::<std::result::Result<Vec<_>,_>>()?;
+        let sent=reply["sent"].as_array().ok_or("Wan GPU 1 events")?.iter().map(|e|e.as_u64().map(|e|Event(e as usize)).ok_or("Wan GPU 1 event"))
+            .collect::<std::result::Result<Vec<_>,_>>()?;
+        Ok((bufs.try_into().map_err(|_|"Wan GPU 1 split buffers")?,sent.try_into().map_err(|_|"Wan GPU 1 events")?))
+    }
+    /// GPU 0's `sent` events of block 0's split (created on GPU 0's thread).
+    pub(crate) fn split_events(&self)->Result<[Event;2]>{
+        if self.sent.get().is_none(){self.sent.set([Event::new()?,Event::new()?]).map_err(|_|"Wan GPU 0 events set twice")?;}
+        Ok(*self.sent.get().unwrap())
     }
     pub(crate) fn forward(&self,latent:u64,t:i64,out:u64,device:&Device)->Result<Pending>{
         let ready=*self.ready.get().ok_or("Wan CFG peer not configured")?;

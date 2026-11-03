@@ -497,9 +497,10 @@ __device__ __forceinline__ float hi_f(unsigned u) { return __uint_as_float(u & 0
 // 128 j + 4 l .. + 3 (j < 40): square_mean_rows' lanes and order, so the mean of squares is that
 // kernel's sum of the same values in registers. The normalized values are rms_apply8's expressions
 // and the rotation rms_rope8's (lane l's two pairs per head take the factors of pairs 2 l, 2 l + 1).
+// Row l of x is token `first` + l.
 template <bool Rope>
 __global__ void __launch_bounds__(128) rms_rows(const B* x, const B* w, const double* freqs, B* out, int64_t rows, float eps,
-                                                float factor, int hh, int ww) {
+                                                float factor, int hh, int ww, int64_t first) {
     const int lane = threadIdx.x;
     const int64_t l = int64_t(blockIdx.x) * blockDim.y + threadIdx.y;
     if (l >= rows) return;
@@ -510,7 +511,7 @@ __global__ void __launch_bounds__(128) rms_rows(const B* x, const B* w, const do
     double2 cd[2];
     if (Rope) {
         int fi, hi, wi;
-        cell(l, hh, ww, fi, hi, wi);
+        cell(first + l, hh, ww, fi, hi, wi);
         #pragma unroll
         for (int q = 0; q < 2; ++q) {
             const int j = 2 * lane + q;
@@ -651,16 +652,18 @@ int w21_rms_rope(const void* x, const void* mean, const void* weight, const void
             (const double*)freqs, (B*)out, cols, eps, h, w, tokens);
     return cudaGetLastError();
 }
-// WanRMSNorm of bf16 [rows, 5120] (then rope when freqs is set, rows = f_ h w tokens) with the mean of
-// squares reduced in the kernel; only for rows wan_square_mean_bf16 reduces with square_mean_rows
-// (wan_square_mean_warp_rows), whose factor this takes.
+// WanRMSNorm of bf16 [rows, 5120] (then rope when freqs is set: tokens first .. first + rows of an
+// f_ h w grid) with the mean of squares reduced in the kernel; only for rows wan_square_mean_bf16
+// reduces with square_mean_rows (wan_square_mean_warp_rows), whose factor this takes.
 int w21_rms_rows(const void* x, const void* weight, const void* freqs, void* out, int64_t rows, int f_, int h, int w, float eps,
-                 float factor, cudaStream_t s) {
-    if (rows < 1 || !vec8(8, {x, weight, out}) || (freqs && (!vec8(8, {freqs}) || rows != int64_t(f_) * h * w)))
+                 float factor, int64_t first, cudaStream_t s) {
+    if (rows < 1 || first < 0 || !vec8(8, {x, weight, out}) ||
+        (freqs && (!vec8(8, {freqs}) || first + rows > int64_t(f_) * h * w)))
         return cudaErrorInvalidValue;
     const unsigned grid = unsigned((rows + 3) / 4);
-    if (freqs) rms_rows<true><<<grid, dim3(32, 4), 0, s>>>((const B*)x, (const B*)weight, (const double*)freqs, (B*)out, rows, eps, factor, h, w);
-    else rms_rows<false><<<grid, dim3(32, 4), 0, s>>>((const B*)x, (const B*)weight, nullptr, (B*)out, rows, eps, factor, 0, 0);
+    if (freqs) rms_rows<true><<<grid, dim3(32, 4), 0, s>>>((const B*)x, (const B*)weight, (const double*)freqs, (B*)out, rows, eps, factor, h, w,
+                                                          first);
+    else rms_rows<false><<<grid, dim3(32, 4), 0, s>>>((const B*)x, (const B*)weight, nullptr, (B*)out, rows, eps, factor, 0, 0, 0);
     return cudaGetLastError();
 }
 int w21_rope(const void* x, const void* freqs, void* out, void* out_f32, int heads, int f_, int h, int w, cudaStream_t s) {

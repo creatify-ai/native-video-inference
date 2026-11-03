@@ -162,14 +162,23 @@ they compute:
 - Freed activations stay in a pool of up to 96 GiB for reuse by size, so the decoder's temporaries
   are not freed and reallocated.
 
-With [SGLang](https://github.com/sgl-project/sglang) 0.5.22 on one B200 (`sglang serve --model-path
-Lightricks/LTX-2.5-Diffusers --pipeline-class-name LTX2TwoStagePipeline`, the same prompt and seed,
-the second of two requests), text encoding and the two stages take 2.8 s. Its default skips LTX 2.5's
-diffusion video decoder and decodes the latents once with the VAE, so its request takes 5.0 s but
-its frames are not the official pipeline's. With the official decoder (`--load-diffusion-decoder`
-and `use_diffusion_decoder`) a request takes 114.5 s on one B200 and 110.3 s on two. On two B200s
-(`--num-gpus 2`, sequence parallel), its text encoding and two stages take 1.9 s; here, with
-`--gpus 2`, the final latents are ready after 1.86 s and the request takes 7.9 s.
+Compared with [SGLang](https://github.com/sgl-project/sglang) 0.5.22 (`sglang serve --model-path
+Lightricks/LTX-2.5-Diffusers --pipeline-class-name LTX2TwoStagePipeline`, `--num-gpus 2` on two,
+which runs sequence parallel) in one container: SGLang's server for two requests, then `ltx25 infer`
+with `LTX25_REPEAT=2`, the same prompt and seed, in two alternating rounds. For the warm request,
+SGLang's column is its text encoding and two stages; ours is from receiving the request to the final
+latents, the same work:
+
+| One container | native-video-inference | SGLang 0.5.22 |
+| --- | ---: | ---: |
+| One B200 | 1.80–1.81 s | 2.75–2.83 s |
+| Two B200s | 1.80–1.85 s | 1.93–1.96 s |
+
+Every native round's latents had the reference's hashes. SGLang's default skips LTX 2.5's diffusion
+video decoder and decodes the latents once with the VAE, so its request takes 4.0–6.0 s but its
+frames are not the official pipeline's; ours take 6.6–7.6 s with that decoder. With the official
+decoder (`--load-diffusion-decoder` and `use_diffusion_decoder`), SGLang's request took 114.5 s on
+one B200 and 110.3 s on two.
 
 ## GPU and host
 
