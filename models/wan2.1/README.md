@@ -127,8 +127,10 @@ modal run examples/modal/wan21.py --gpus 2   # on a B200:2 container
   image and CLIP features, so they agree up to block 0's text cross-attention. On one GPU the
   unconditional pass starts from the conditional pass's state at that point (`dit::Prefix`). On
   two, the GPUs split block 0's self-attention by query rows and exchange their halves over the
-  peer link (`dit::AttnSplit`); cuDNN computes every row of a range with the whole sequence's plan,
-  so the bytes do not change.
+  peer link (`dit::AttnSplit`), and the second GPU, once its own pass is done, computes half the
+  rows of the conditional pass's last block and head (`Dit::peer_last_block`). cuDNN computes every
+  row of a range with the whole sequence's plan, and cuBLAS computes each of these products on half
+  the rows exactly as on all of them, so the bytes do not change.
   There is no attention sparsity, step caching or quantization.
 - **Resolution.** The output keeps the input's aspect ratio within `max_area`, and both sides are
   multiples of 16. Parity was recorded at 1280×720, 720×1280, 1264×720, 720×1264, 960×960,

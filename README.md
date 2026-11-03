@@ -133,23 +133,25 @@ and image conditioning. The warm column was measured again on 2026-11-02 for nat
 and SGLang (vLLM-Omni's is from 2026-11-01). A request's time moves by about 2% between B200 hosts,
 more than the gap between the two, so the comparison below runs both in one container: SGLang's
 server for two requests, then `wan21-generate --repeat 2` (two requests in one process), in two
-alternating rounds per GPU count:
+alternating rounds per GPU count (2026-11-03; round 1 / round 2):
 
 | One container, warm request | native-video-inference | SGLang 0.5.22 |
 | --- | ---: | ---: |
-| One B200: request | 390.3–390.4 s | 398.2 s |
-| One B200: the 40 steps | 387.1–387.2 s | 391.3–391.4 s |
-| Two B200s: request | 204.3 s | 209.7–210.7 s |
-| Two B200s: the 40 steps | 200.97–200.99 s | 200.91–201.02 s |
+| One B200: request | 398.5 / 398.5 s | 406.2 / 406.3 s |
+| One B200: the 40 steps | 395.3 / 395.3 s | 399.2 / 399.1 s |
+| Two B200s: request | 204.4 / 204.6 s | 209.6 / 210.6 s |
+| Two B200s: the 40 steps | 201.17 / 201.34 s | 201.29 / 202.00 s |
 
 The VAE decode takes 3.2 s natively and 5.4–5.8 s with SGLang. With `--num-gpus 2` SGLang also
 runs the unconditional pass of classifier-free guidance on the second GPU. On one GPU the steps are
 1% faster natively because the unconditional pass starts from the conditional pass's state at
-block 0's text cross-attention (both read the same latent, timestep and image up to there); on two,
-the GPUs split that shared part by rows instead, and a step takes as long as SGLang's. Either way a
-step waits for the slower of the two GPUs, and with both busy the first B200 ran 2–3% slower than the
-second in every container we traced. A first request costs natively about 0.5 s more in its steps
-(work done once per process; SGLang's server runs three warm-up requests before serving).
+block 0's text cross-attention (both read the same latent, timestep and image up to there). On two,
+the GPUs split that shared part by rows instead, and the second GPU, once its own pass is done,
+computes half the rows of the conditional pass's last block. A step still waits for the slower of
+the two GPUs, and which one is slower changes from container to container, so the two-GPU margin is
+small: 0.1 and 0.7 s over the 40 steps in the two rounds. A first request's steps take natively at
+most 0.15 s longer than a warm request's (the first request's 40 steps: 395.4 / 395.3 s against
+SGLang's 399.3 / 399.0 s on one B200, 201.23 / 201.45 s against 201.35 / 202.14 s on two).
 native-video-inference reproduces the official pipeline's output byte for byte, on one GPU or two;
 SGLang's output differs from it.
 

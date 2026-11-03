@@ -89,15 +89,15 @@ fn bshd(rows: usize) -> View {
 }
 
 static SPLIT_PLANS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Two GPUs split block 0's self-attention in halves (`AttnSplit`): plan those shapes with the others.
+/// Two GPUs split block 0 and the last block in halves (`AttnSplit`): plan those shapes with the others.
 pub fn plan_attention_split() { SPLIT_PLANS.store(true, std::sync::atomic::Ordering::Relaxed); }
 
-/// Plans for the grid's three attention shapes (self, image, text), and the self-attention halves
-/// when two GPUs split it: the largest workspace.
+/// Plans for the grid's three attention shapes (self, image, text), and their halves when two GPUs
+/// split them: the largest workspace.
 fn attention_plans(grid: Grid) -> Result<usize> {
     let s = grid.tokens();
     let halves: &[(usize, usize)] = if SPLIT_PLANS.load(std::sync::atomic::Ordering::Relaxed) {
-        &[(s / 2, s), (s - s / 2, s), (s / 2, CLIP_TOKENS), (s - s / 2, CLIP_TOKENS)]
+        &[(s / 2, s), (s - s / 2, s), (s / 2, CLIP_TOKENS), (s - s / 2, CLIP_TOKENS), (s / 2, TEXT_LEN), (s - s / 2, TEXT_LEN)]
     } else { &[] };
     Ok([(s, s), (s, CLIP_TOKENS), (s, TEXT_LEN)].iter().chain(halves)
         .map(|&(q, k)| sdpa::prepare(Io::Bf16, &bshd(q), &bshd(k), &bshd(k)).map(|p| p.workspace))
@@ -115,8 +115,13 @@ fn attention_workspace(grid: Grid) -> Result<Option<Buffer>> {
 pub struct PassContext {
     pub text: Buffer,      // bf16 [512, 5120] text_embedding output
     pub image_f32: Buffer, // fp32 [257, 5120] img_emb output (the reference's context_clip)
-    k: Vec<Buffer>, v: Vec<Buffer>, k_img: Vec<Buffer>, v_img: Vec<Buffer>,
+    /// Block i's k, v (bf16 [512, 5120]), k_img, v_img (bf16 [257, 5120]) at `i * CONTEXT_KV_BYTES`,
+    /// in one allocation.
+    kv: Buffer,
 }
+const TEXT_KV_BYTES: usize = TEXT_LEN * DIM * 2;
+const IMAGE_KV_BYTES: usize = CLIP_TOKENS * DIM * 2;
+const CONTEXT_KV_BYTES: usize = 2 * (TEXT_KV_BYTES + IMAGE_KV_BYTES);
 
 /// The two CFG passes of a step read the same latent, timestep, image and CLIP features, so they
 /// agree up to block 0's text cross-attention. A `Prefix` keeps that point of the first pass for
@@ -152,7 +157,7 @@ impl Rendezvous {
         let (state, wait) = self.arrived.wait_timeout_while(state, std::time::Duration::from_secs(300), |s| s.0 == generation)
             .map_err(|_| "Wan rendezvous poisoned")?;
         drop(state);
-        if wait.timed_out() { return Err("the other GPU's forward did not reach block 0's attention".into()); }
+        if wait.timed_out() { return Err("the other GPU's forward did not reach the split block".into()); }
         Ok(())
     }
 }
@@ -162,9 +167,17 @@ impl Rendezvous {
 /// its keys and values to the other GPU (`peer`: the other's k, v, x, qn and image-attention
 /// buffers on `peer_device`) and records `sent[0]`, waits for the other's (`peer_sent[0]`), then
 /// sends its residual, normalized queries and image attention (`sent[1]`, `peer_sent[1]`).
+///
+/// GPU 1 finishes its pass sooner, so it also computes its rows of GPU 0's last block and head
+/// (`main`: this GPU's pass is the one split; `last_text`: GPU 1's copy of GPU 0's text keys and
+/// values for that block). GPU 0 records `sent[2]` with its keys and values of the block, GPU 1
+/// then takes its rows of the block input and those keys and values and records its own `sent[2]`
+/// with its keys and values, and `sent[3]` once its head rows are in GPU 0's head output. `peer`
+/// also holds the other's norm1 output (xm) and head output.
 pub struct AttnSplit {
-    pub rows: (usize, usize), pub device: i32, pub peer_device: i32, pub peer: [u64; 5],
-    pub sent: [crate::cuda::Event; 2], pub peer_sent: [crate::cuda::Event; 2], pub meet: std::sync::Arc<Rendezvous>,
+    pub rows: (usize, usize), pub device: i32, pub peer_device: i32, pub peer: [u64; 7],
+    pub sent: [crate::cuda::Event; 4], pub peer_sent: [crate::cuda::Event; 4], pub meet: std::sync::Arc<Rendezvous>,
+    pub main: bool, pub last_text: Option<[Buffer; 2]>,
 }
 
 pub struct Dit<'d> {
@@ -182,8 +195,10 @@ pub struct Dit<'d> {
     /// Seconds into `load_from` at which each setup stage finished (startup diagnostics).
     pub setup: Vec<(&'static str, f64)>,
     split: Option<AttnSplit>,
-    /// (e, e0) by timestep (fp32 [7, 5120]), so a repeated schedule's embeddings are copies.
-    times: std::cell::RefCell<std::collections::HashMap<i64, Buffer>>,
+    /// The device address of (e, e0) by timestep (fp32 [7, 5120], in `time_store`), so a repeated
+    /// schedule's embeddings are copies.
+    times: std::cell::RefCell<std::collections::HashMap<i64, u64>>,
+    time_store: std::cell::RefCell<Vec<Buffer>>,
 }
 
 /// Activation buffers of one forward (sized for the grid, reused across blocks and steps).
@@ -191,7 +206,7 @@ struct Scratch {
     x_in: Buffer, conv: Buffer, tokens: Buffer, x: Buffer, xm: Buffer, q: Buffer, k: Buffer, v: Buffer, sq: Buffer,
     mean: Buffer, qn: Buffer, kn: Buffer, qr: Buffer, kr: Buffer, attn: Buffer, y: Buffer, img: Buffer, txt: Buffer,
     sum: Buffer, h: Buffer, g: Buffer, e_blk: Buffer, e_next: Buffer, sinus: Buffer, t1: Buffer, t1s: Buffer, e: Buffer, es: Buffer,
-    e0: Buffer, eh: Buffer, head: Buffer, t_dev: Buffer,
+    e0: Buffer, eh: Buffer, head: Buffer,
 }
 impl Scratch {
     fn new(grid: Grid) -> Result<Self> {
@@ -204,7 +219,7 @@ impl Scratch {
             y: act(2)?, img: act(2)?, txt: act(2)?, sum: act(2)?, h: Buffer::new(s * FFN * 2)?, g: Buffer::new(s * FFN * 2)?,
             e_blk: Buffer::new(6 * DIM * 4)?, e_next: Buffer::new(6 * DIM * 4)?, sinus: Buffer::new(FREQ_DIM * 4)?, t1: Buffer::new(DIM * 4)?,
             t1s: Buffer::new(DIM * 4)?, e: Buffer::new(DIM * 4)?, es: Buffer::new(DIM * 4)?, e0: Buffer::new(6 * DIM * 4)?,
-            eh: Buffer::new(2 * DIM * 4)?, head: Buffer::new(s * 64 * 4)?, t_dev: Buffer::new(8)?,
+            eh: Buffer::new(2 * DIM * 4)?, head: Buffer::new(s * 64 * 4)?,
         })
     }
 }
@@ -256,27 +271,51 @@ impl<'d> Dit<'d> {
         mark("sdpa_plans")?;
         let sc = Scratch::new(grid)?;
         mark("scratch")?;
-        Ok(Self { device, grid, linear, conv, bf16, f32, freqs, ws, sc, debug: None, setup, split: None,
-                  times: Default::default() })
+        let mut dit = Self { device, grid, linear, conv, bf16, f32, freqs, ws, sc, debug: None, setup, split: None,
+                             times: Default::default(), time_store: Default::default() };
+        dit.plan_patch_conv()?;
+        device.sync()?;
+        dit.setup.push(("conv_plan", t.elapsed().as_secs_f64()));
+        Ok(dit)
     }
-    /// Splits block 0's self-attention with the other GPU (`None` computes all of it). Builds the
-    /// range's plan and grows the workspace if it needs more.
+    /// The patch embedding's Conv3d(36 -> 5120, 1x2x2) on the grid's latent.
+    fn patch_conv(&self) -> ConvSpec {
+        let g = self.grid;
+        let input = [1, IN_CHANNELS as i64, g.frames as i64, g.height as i64, g.width as i64];
+        let weight = [DIM as i64, IN_CHANNELS as i64, 1, 2, 2];
+        let output = [1, DIM as i64, g.frames as i64, (g.height / 2) as i64, (g.width / 2) as i64];
+        ConvSpec { ndim: 5, dtype: 2, transposed: 0, allow_tf32: 1, deterministic: 1, channels_last: 0,
+            input_dims: input, input_strides: contiguous(&input), weight_dims: weight, weight_strides: contiguous(&weight),
+            output_dims: output, output_strides: contiguous(&output), padding: [0; 3], stride: [1, 2, 2], dilation: [1; 3] }
+    }
+    /// Builds the patch embedding's cuDNN plan (on first use, like pinned PyTorch, it is built and
+    /// run once) on zeros in the forward's own buffers, so that the first request does not.
+    fn plan_patch_conv(&self) -> Result<()> {
+        self.sc.x_in.zero(self.device)?;
+        self.conv.forward(&self.patch_conv(), self.sc.x_in.dev(), self.b("patch_embedding.weight"), self.sc.conv.dev(), self.s())
+    }
+    /// Splits block 0 and GPU 0's last block with the other GPU (`None` computes all of them).
+    /// Builds the range's plans and grows the workspace if they need more.
     pub fn set_split(&mut self, split: Option<AttnSplit>) -> Result<()> {
         if let Some(sp) = &split {
             let s = self.grid.tokens();
             if sp.rows.0 >= sp.rows.1 || sp.rows.1 > s { return Err("Wan attention split rows outside the sequence".into()); }
+            if sp.main != (sp.rows.0 == 0) || (!sp.main && sp.last_text.is_none()) {
+                return Err("Wan split: GPU 0 takes the first rows and GPU 1 needs the last block's text keys".into());
+            }
             let r = sp.rows.1 - sp.rows.0;
-            let need = sdpa::prepare(Io::Bf16, &bshd(r), &bshd(s), &bshd(s))?.workspace
-                .max(sdpa::prepare(Io::Bf16, &bshd(r), &bshd(CLIP_TOKENS), &bshd(CLIP_TOKENS))?.workspace);
+            let mut need = 0;
+            for k in [s, CLIP_TOKENS, TEXT_LEN] { need = need.max(sdpa::prepare(Io::Bf16, &bshd(r), &bshd(k), &bshd(k))?.workspace); }
             if need > self.ws.as_ref().map_or(0, |w| w.bytes()) { self.ws = Some(Buffer::new(need)?); }
         }
         self.split = split;
         Ok(())
     }
-    /// The buffers the other GPU of a split writes its rows of: k, v, x, qn, image attention.
-    pub fn split_buffers(&self) -> [u64; 5] {
+    /// The buffers the other GPU of a split reads or writes its rows of: k, v, x, qn, image
+    /// attention, norm1 output (xm) and head output.
+    pub fn split_buffers(&self) -> [u64; 7] {
         let sc = &self.sc;
-        [sc.kr.dev(), sc.v.dev(), sc.x.dev(), sc.qn.dev(), sc.img.dev()]
+        [sc.kr.dev(), sc.v.dev(), sc.x.dev(), sc.qn.dev(), sc.img.dev(), sc.xm.dev(), sc.head.dev()]
     }
     /// Re-sizes the activation buffers and the attention workspace for another latent grid.
     pub fn set_grid(&mut self, grid: Grid) -> Result<()> {
@@ -286,6 +325,7 @@ impl<'d> Dit<'d> {
         self.sc = Scratch::new(grid)?;
         self.ws = attention_workspace(grid)?;
         self.grid = grid;
+        self.plan_patch_conv()?;
         if self.debug.is_some() { self.enable_debug()?; }
         Ok(())
     }
@@ -298,7 +338,10 @@ impl<'d> Dit<'d> {
     /// (e, e0) of the last `time` call.
     pub fn time_buffers(&self) -> (u64, u64) { (self.sc.e.dev(), self.sc.e0.dev()) }
     /// Block `i`'s cross-attention (k, v, k_img, v_img) of a pass context.
-    pub fn context_kv(ctx: &PassContext, i: usize) -> [u64; 4] { [ctx.k[i].dev(), ctx.v[i].dev(), ctx.k_img[i].dev(), ctx.v_img[i].dev()] }
+    pub fn context_kv(ctx: &PassContext, i: usize) -> [u64; 4] {
+        let (k, t, m) = (ctx.kv.dev() + (i * CONTEXT_KV_BYTES) as u64, TEXT_KV_BYTES as u64, IMAGE_KV_BYTES as u64);
+        [k, k + t, k + 2 * t, k + 2 * t + m]
+    }
     fn b(&self, name: &str) -> u64 { self.bf16[name].dev() }
     fn f(&self, name: &str) -> u64 { self.f32[name].dev() }
     fn s(&self) -> Stream { self.device.stream }
@@ -318,11 +361,13 @@ impl<'d> Dit<'d> {
     /// x += y * gate (or x += y) in place, then LayerNorm `mode` of the new x into xm: the bytes of the
     /// residual kernel followed by `ln`, in one pass over the rows.
     #[allow(clippy::too_many_arguments)]
-    fn residual_ln(&self, mode: LnMode, gate: Option<u64>, y: u64, gamma: u64, beta: u64, e0: u64, e1: u64, rows: usize)
-                   -> Result<()> {
-        check(unsafe { w21_residual_layer_norm(mode as c_int, c_int::from(gate.is_some()), p(self.sc.x.dev()), p(y),
-                                               p(gate.unwrap_or(0)), p(gamma), p(beta), p(e0), p(e1), p(self.sc.xm.dev()),
-                                               rows as i64, DIM as c_int, EPS, self.s()) }, "residual layer norm")
+    /// `first`: the first token row of x and xm (y is the caller's address of that row).
+    fn residual_ln(&self, mode: LnMode, gate: Option<u64>, y: u64, gamma: u64, beta: u64, e0: u64, e1: u64, first: usize,
+                   rows: usize) -> Result<()> {
+        let (x, xm) = (self.sc.x.dev() + (first * DIM * 4) as u64, self.sc.xm.dev() + (first * DIM * 2) as u64);
+        check(unsafe { w21_residual_layer_norm(mode as c_int, c_int::from(gate.is_some()), p(x), p(y), p(gate.unwrap_or(0)),
+                                               p(gamma), p(beta), p(e0), p(e1), p(xm), rows as i64, DIM as c_int, EPS,
+                                               self.s()) }, "residual layer norm")
     }
     /// WanRMSNorm over the last dim of x (bf16 [rows, 5120]); the mean of squares is torch's reduction
     /// of the fp32 square, squared at the load.
@@ -388,7 +433,8 @@ impl<'d> Dit<'d> {
                 sc.xm.dev() + o2, rows, EPS, false)?;
         self.lin(sc.xm.dev() + o2, &w("cross_attn.q"), sc.q.dev() + o2, rows, DIM, DIM)?;
         self.rms(sc.q.dev() + o2, &w("cross_attn.norm_q.weight"), sc.qn.dev() + o2, rows)?;
-        self.attention(sc.qn.dev() + o2, ctx.k_img[0].dev(), ctx.v_img[0].dev(), sc.img.dev() + o2, rows, CLIP_TOKENS)?;
+        let [_, _, k_img, v_img] = Self::context_kv(ctx, 0);
+        self.attention(sc.qn.dev() + o2, k_img, v_img, sc.img.dev() + o2, rows, CLIP_TOKENS)?;
         send(sp.peer[2] + o4, sc.x.dev() + o4, rows * DIM * 4)?;
         send(sp.peer[3] + o2, sc.qn.dev() + o2, b2)?;
         send(sp.peer[4] + o2, sc.img.dev() + o2, b2)?;
@@ -428,42 +474,56 @@ impl<'d> Dit<'d> {
                 image_f32.dev(), n, LN_EPS_MLP, false)?;
         let image = Buffer::new(n * DIM * 2)?;
         check(unsafe { w21_cast(0, p(image_f32.dev()), p(image.dev()), (n * DIM) as i64, st) }, "context_clip cast")?;
-        let (mut k, mut v, mut k_img, mut v_img) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let raw = Buffer::new(TEXT_LEN * DIM * 2)?;
+        // One allocation for every block's keys and values (a request's first allocations are
+        // device allocations; each block's offset keeps a 1 KiB alignment).
+        let pass = PassContext { text, image_f32, kv: Buffer::new(LAYERS * CONTEXT_KV_BYTES)? };
         for i in 0..LAYERS {
-            let (kb, vb, kib, vib) = (Buffer::new(TEXT_LEN * DIM * 2)?, Buffer::new(TEXT_LEN * DIM * 2)?, Buffer::new(n * DIM * 2)?,
-                                      Buffer::new(n * DIM * 2)?);
-            self.lin(text.dev(), &block_param(i, "cross_attn.k"), raw.dev(), TEXT_LEN, DIM, DIM)?;
-            self.rms(raw.dev(), &block_param(i, "cross_attn.norm_k.weight"), kb.dev(), TEXT_LEN)?;
-            self.lin(text.dev(), &block_param(i, "cross_attn.v"), vb.dev(), TEXT_LEN, DIM, DIM)?;
+            let [kb, vb, kib, vib] = Self::context_kv(&pass, i);
+            self.lin(pass.text.dev(), &block_param(i, "cross_attn.k"), raw.dev(), TEXT_LEN, DIM, DIM)?;
+            self.rms(raw.dev(), &block_param(i, "cross_attn.norm_k.weight"), kb, TEXT_LEN)?;
+            self.lin(pass.text.dev(), &block_param(i, "cross_attn.v"), vb, TEXT_LEN, DIM, DIM)?;
             self.lin(image.dev(), &block_param(i, "cross_attn.k_img"), raw.dev(), n, DIM, DIM)?;
-            self.rms(raw.dev(), &block_param(i, "cross_attn.norm_k_img.weight"), kib.dev(), n)?;
-            self.lin(image.dev(), &block_param(i, "cross_attn.v_img"), vib.dev(), n, DIM, DIM)?;
-            k.push(kb); v.push(vb); k_img.push(kib); v_img.push(vib);
+            self.rms(raw.dev(), &block_param(i, "cross_attn.norm_k_img.weight"), kib, n)?;
+            self.lin(image.dev(), &block_param(i, "cross_attn.v_img"), vib, n, DIM, DIM)?;
         }
-        Ok(PassContext { text, image_f32, k, v, k_img, v_img })
+        Ok(pass)
     }
 
     /// e (fp32 [5120]) and e0 (fp32 [6, 5120]) of timestep `t` (the scheduler's int64 timestep):
     /// stream-ordered copies of the ones computed for `t` before, else computed (and kept).
     pub fn time(&self, t: i64) -> Result<()> {
         let (st, sc) = (self.s(), &self.sc);
-        let (e, e0) = (DIM * 4, 6 * DIM * 4);
-        if let Some(kept) = self.times.borrow().get(&t) {
-            check(unsafe { crate::cuda::memcpy_d2d(sc.e.dev(), kept.dev(), e, st) }, "kept e")?;
-            return check(unsafe { crate::cuda::memcpy_d2d(sc.e0.dev(), kept.dev() + e as u64, e0, st) }, "kept e0");
+        let e = DIM * 4;
+        if !self.times.borrow().contains_key(&t) { self.prepare_times(&[t])?; }
+        let kept = self.times.borrow()[&t];
+        check(unsafe { crate::cuda::memcpy_d2d(sc.e.dev(), kept, e, st) }, "kept e")?;
+        check(unsafe { crate::cuda::memcpy_d2d(sc.e0.dev(), kept + e as u64, 6 * e, st) }, "kept e0")
+    }
+    /// Computes and keeps the embeddings of the timesteps not kept yet: one upload and one
+    /// allocation for all of them, so a schedule's embeddings wait for the host once.
+    pub fn prepare_times(&self, timesteps: &[i64]) -> Result<()> {
+        let mut new = Vec::new();
+        for &t in timesteps { if !self.times.borrow().contains_key(&t) && !new.contains(&t) { new.push(t); } }
+        if new.is_empty() { return Ok(()); }
+        let (st, sc, row) = (self.s(), &self.sc, 7 * DIM * 4);
+        let ts = Buffer::new(8 * new.len())?;
+        upload_into(&ts, &new.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>(), self.device)?;
+        let kept = Buffer::new(new.len() * row)?;
+        for (j, &t) in new.iter().enumerate() {
+            self.time_compute(ts.dev() + 8 * j as u64)?;
+            let at = kept.dev() + (j * row) as u64;
+            check(unsafe { crate::cuda::memcpy_d2d(at, sc.e.dev(), DIM * 4, st) }, "keep e")?;
+            check(unsafe { crate::cuda::memcpy_d2d(at + (DIM * 4) as u64, sc.e0.dev(), 6 * DIM * 4, st) }, "keep e0")?;
+            self.times.borrow_mut().insert(t, at);
         }
-        self.time_compute(t)?;
-        let kept = Buffer::new(e + e0)?;
-        check(unsafe { crate::cuda::memcpy_d2d(kept.dev(), sc.e.dev(), e, st) }, "keep e")?;
-        check(unsafe { crate::cuda::memcpy_d2d(kept.dev() + e as u64, sc.e0.dev(), e0, st) }, "keep e0")?;
-        self.times.borrow_mut().insert(t, kept);
+        self.time_store.borrow_mut().extend([ts, kept]);
         Ok(())
     }
-    fn time_compute(&self, t: i64) -> Result<()> {
+    /// `t`: the device address of the int64 timestep.
+    fn time_compute(&self, t: u64) -> Result<()> {
         let (st, sc) = (self.s(), &self.sc);
-        upload_into(&sc.t_dev, &t.to_le_bytes(), self.device)?;
-        check(unsafe { w21_sinusoidal(p(sc.t_dev.dev()), p(sc.sinus.dev()), FREQ_DIM as c_int, st) }, "sinusoidal")?;
+        check(unsafe { w21_sinusoidal(p(t), p(sc.sinus.dev()), FREQ_DIM as c_int, st) }, "sinusoidal")?;
         self.lin_f32(sc.sinus.dev(), "time_embedding.0", sc.t1.dev(), 1, DIM, FREQ_DIM)?;
         eager::silu_f32(sc.t1.dev(), sc.t1s.dev(), DIM, st)?;
         self.lin_f32(sc.t1s.dev(), "time_embedding.2", sc.e.dev(), 1, DIM, DIM)?;
@@ -491,13 +551,7 @@ impl<'d> Dit<'d> {
             // Patch embedding: bf16(cat([x, y])) -> Conv3d(36 -> 5120, 1x2x2) -> + bias -> tokens.
             check(unsafe { w21_cat_cast_bf16(p(latent), p(y), p(sc.x_in.dev()), g.latent_elements(OUT_CHANNELS) as i64,
                                              g.latent_elements(IN_CHANNELS - OUT_CHANNELS) as i64, st) }, "patch input")?;
-            let input = [1, IN_CHANNELS as i64, fr as i64, g.height as i64, g.width as i64];
-            let weight = [DIM as i64, IN_CHANNELS as i64, 1, 2, 2];
-            let output = [1, DIM as i64, fr as i64, hh as i64, ww as i64];
-            let spec = ConvSpec { ndim: 5, dtype: 2, transposed: 0, allow_tf32: 1, deterministic: 1, channels_last: 0,
-                input_dims: input, input_strides: contiguous(&input), weight_dims: weight, weight_strides: contiguous(&weight),
-                output_dims: output, output_strides: contiguous(&output), padding: [0; 3], stride: [1, 2, 2], dilation: [1; 3] };
-            self.conv.forward(&spec, sc.x_in.dev(), self.b("patch_embedding.weight"), sc.conv.dev(), st)?;
+            self.conv.forward(&self.patch_conv(), sc.x_in.dev(), self.b("patch_embedding.weight"), sc.conv.dev(), st)?;
             eager::add_channel_bias_bf16(sc.conv.dev(), self.b("patch_embedding.bias"), DIM, s, st)?;
             eager::transpose_bf16(sc.conv.dev(), sc.tokens.dev(), DIM, s, st)?;
             observe("patch_embedding/out", sc.conv.dev())?;
@@ -511,7 +565,13 @@ impl<'d> Dit<'d> {
                                             (6 * DIM) as i64, st) }, "modulation")
         };
         modulation(0, e_bufs[0])?;
+        let last = self.split.as_ref().filter(|sp| sp.main);
         for i in 0..LAYERS {
+            if let (true, Some(sp)) = (i + 1 == LAYERS, last) {
+                // GPU 1 computes the other rows of the last block and the head (`peer_last_block`).
+                self.last_block_split(sp, ctx)?;
+                break;
+            }
             let w = |n: &str| block_param(i, n);
             let (x_in, x_bf16) = if i == 0 { (sc.tokens.dev(), true) } else { (sc.x.dev(), false) };
             let eb = e_bufs[i % 2];
@@ -519,6 +579,7 @@ impl<'d> Dit<'d> {
             let mut b0 = |name: &str, addr: u64| if i == 0 { observe(&format!("b0/{name}"), addr) } else { Ok(()) };
             // Block 0's cross-attention queries and image attention (the shared prefix's when reused).
             let (mut qn, mut img) = (sc.qn.dev(), sc.img.dev());
+            let [k_txt, v_txt, k_img, v_img] = Self::context_kv(ctx, i);
             if let (0, Some(prefix)) = (i, reuse) {
                 check(unsafe { crate::cuda::memcpy_d2d(sc.x.dev(), prefix.x1.dev(), s * DIM * 4, st) }, "prefix residual")?;
                 (qn, img) = (prefix.qn.dev(), prefix.img.dev());
@@ -567,13 +628,13 @@ impl<'d> Dit<'d> {
                     b0("xm_cross", sc.xm.dev())?;
                 } else {
                     self.residual_ln(LnMode::AffineBf16, Some(e(2)), sc.y.dev(), self.f(&w("norm3.weight")), self.f(&w("norm3.bias")),
-                                     0, 0, s)?;
+                                     0, 0, 0, s)?;
                 }
                 self.lin(sc.xm.dev(), &w("cross_attn.q"), sc.q.dev(), s, DIM, DIM)?;
                 b0("cq", sc.q.dev())?;
                 self.rms(sc.q.dev(), &w("cross_attn.norm_q.weight"), sc.qn.dev(), s)?;
                 b0("cqn", sc.qn.dev())?;
-                self.attention(sc.qn.dev(), ctx.k_img[i].dev(), ctx.v_img[i].dev(), sc.img.dev(), s, CLIP_TOKENS)?;
+                self.attention(sc.qn.dev(), k_img, v_img, sc.img.dev(), s, CLIP_TOKENS)?;
                 if let (0, Share::Store(prefix)) = (i, share) {
                     for (dst, src, bytes) in [(prefix.x1.dev(), sc.x.dev(), s * DIM * 4), (prefix.qn.dev(), sc.qn.dev(), s * DIM * 2),
                                               (prefix.img.dev(), sc.img.dev(), s * DIM * 2)] {
@@ -581,7 +642,7 @@ impl<'d> Dit<'d> {
                     }
                 }
             }
-            self.attention(qn, ctx.k[i].dev(), ctx.v[i].dev(), sc.txt.dev(), s, TEXT_LEN)?;
+            self.attention(qn, k_txt, v_txt, sc.txt.dev(), s, TEXT_LEN)?;
             b0("img", img)?;
             b0("txt", sc.txt.dev())?;
             eager::add_bf16(sc.txt.dev(), img, sc.sum.dev(), s * DIM, st)?;
@@ -596,7 +657,7 @@ impl<'d> Dit<'d> {
                 self.ln(LnMode::Modulate, In::F32, sc.x.dev(), 0, 0, e(3), e(4), sc.xm.dev(), s, EPS, false)?;
                 b0("xm_ffn", sc.xm.dev())?;
             } else {
-                self.residual_ln(LnMode::Modulate, None, sc.y.dev(), 0, 0, e(3), e(4), s)?;
+                self.residual_ln(LnMode::Modulate, None, sc.y.dev(), 0, 0, e(3), e(4), 0, s)?;
             }
             self.lin(sc.xm.dev(), &w("ffn.0"), sc.h.dev(), s, FFN, DIM)?;
             b0("h", sc.h.dev())?;
@@ -609,20 +670,111 @@ impl<'d> Dit<'d> {
                 // layer_norm's expressions in one pass).
                 let en = e_bufs[(i + 1) % 2];
                 modulation(i + 1, en)?;
-                self.residual_ln(LnMode::Modulate, Some(e(5)), sc.y.dev(), 0, 0, en, en + row4, s)?;
+                self.residual_ln(LnMode::Modulate, Some(e(5)), sc.y.dev(), 0, 0, en, en + row4, 0, s)?;
             } else {
                 check(unsafe { w21_residual_gate(p(sc.x.dev()), 0, p(sc.y.dev()), p(e(5)), p(sc.x.dev()), s as i64, DIM as i64, st) },
                       "residual ffn")?;
             }
             observe(&format!("blocks.{i}/out"), sc.x.dev())?;
         }
-        // Head (fp32 autocast region): modulation + e, LayerNorm * (1 + e1) + e0, fp32 Linear.
-        check(unsafe { w21_add_bf16_f32(p(self.b("head.modulation")), p(sc.e.dev()), p(sc.eh.dev()), (2 * DIM) as i64, DIM as i64,
-                                        st) }, "head modulation")?;
-        self.ln(LnMode::ModulateF32, In::F32, sc.x.dev(), 0, 0, sc.eh.dev(), sc.eh.dev() + row4, sc.sq.dev(), s, EPS, false)?;
-        self.lin_f32(sc.sq.dev(), "head.head", sc.head.dev(), s, 64, DIM)?;
+        if last.is_none() { self.head_rows(0, s)?; }
         observe("head/out", sc.head.dev())?;
         check(unsafe { w21_unpatchify(p(sc.head.dev()), p(out), fr as c_int, hh as c_int, ww as c_int, OUT_CHANNELS as c_int, st) },
               "unpatchify")
+    }
+    /// The head (fp32 autocast region) of token rows `first..first + rows`: modulation + e,
+    /// LayerNorm * (1 + e1) + e0, fp32 Linear.
+    fn head_rows(&self, first: usize, rows: usize) -> Result<()> {
+        let (st, sc, row4, o4) = (self.s(), &self.sc, (DIM * 4) as u64, (first * DIM * 4) as u64);
+        check(unsafe { w21_add_bf16_f32(p(self.b("head.modulation")), p(sc.e.dev()), p(sc.eh.dev()), (2 * DIM) as i64, DIM as i64,
+                                        st) }, "head modulation")?;
+        self.ln(LnMode::ModulateF32, In::F32, sc.x.dev() + o4, 0, 0, sc.eh.dev(), sc.eh.dev() + row4, sc.sq.dev() + o4, rows, EPS,
+                false)?;
+        self.lin_f32(sc.sq.dev() + o4, "head.head", sc.head.dev() + (first * 64 * 4) as u64, rows, 64, DIM)
+    }
+    /// The last block for this GPU's rows of a split and their head: x and xm hold the block's
+    /// input rows, and block LAYERS - 1's modulation is in its buffer (both GPUs' passes computed
+    /// it for the same t). `exchange` runs once this GPU's keys and values are ready and returns
+    /// with the other GPU's rows of them in kr and v. `text`, `img`: the pass's cross-attention
+    /// keys and values of the block.
+    fn last_block_rows(&self, sp: &AttnSplit, text: [u64; 2], img: [u64; 2], exchange: impl FnOnce() -> Result<()>)
+                       -> Result<()> {
+        let (st, sc, s, i) = (self.s(), &self.sc, self.grid.tokens(), LAYERS - 1);
+        let (r0, r1) = sp.rows;
+        let rows = r1 - r0;
+        let (o2, o4, oh) = ((r0 * DIM * 2) as u64, (r0 * DIM * 4) as u64, (r0 * FFN * 2) as u64);
+        let w = |n: &str| block_param(i, n);
+        let eb = [sc.e_blk.dev(), sc.e_next.dev()][i % 2];
+        let e = |k: u64| eb + k * (DIM * 4) as u64;
+        for (name, out) in [("self_attn.q", sc.q.dev()), ("self_attn.k", sc.k.dev()), ("self_attn.v", sc.v.dev())] {
+            self.lin(sc.xm.dev() + o2, &w(name), out + o2, rows, DIM, DIM)?;
+        }
+        self.rms_rope_rows(sc.q.dev() + o2, &w("self_attn.norm_q.weight"), sc.qr.dev() + o2, rows, r0)?;
+        self.rms_rope_rows(sc.k.dev() + o2, &w("self_attn.norm_k.weight"), sc.kr.dev() + o2, rows, r0)?;
+        exchange()?;
+        self.attention(sc.qr.dev() + o2, sc.kr.dev(), sc.v.dev(), sc.attn.dev() + o2, rows, s)?;
+        self.lin(sc.attn.dev() + o2, &w("self_attn.o"), sc.y.dev() + o2, rows, DIM, DIM)?;
+        self.residual_ln(LnMode::AffineBf16, Some(e(2)), sc.y.dev() + o2, self.f(&w("norm3.weight")), self.f(&w("norm3.bias")), 0, 0,
+                         r0, rows)?;
+        self.lin(sc.xm.dev() + o2, &w("cross_attn.q"), sc.q.dev() + o2, rows, DIM, DIM)?;
+        self.rms(sc.q.dev() + o2, &w("cross_attn.norm_q.weight"), sc.qn.dev() + o2, rows)?;
+        self.attention(sc.qn.dev() + o2, img[0], img[1], sc.img.dev() + o2, rows, CLIP_TOKENS)?;
+        self.attention(sc.qn.dev() + o2, text[0], text[1], sc.txt.dev() + o2, rows, TEXT_LEN)?;
+        eager::add_bf16(sc.txt.dev() + o2, sc.img.dev() + o2, sc.sum.dev() + o2, rows * DIM, st)?;
+        self.lin(sc.sum.dev() + o2, &w("cross_attn.o"), sc.y.dev() + o2, rows, DIM, DIM)?;
+        self.residual_ln(LnMode::Modulate, None, sc.y.dev() + o2, 0, 0, e(3), e(4), r0, rows)?;
+        self.lin(sc.xm.dev() + o2, &w("ffn.0"), sc.h.dev() + oh, rows, FFN, DIM)?;
+        eager::gelu_tanh_bf16(sc.h.dev() + oh, sc.g.dev() + oh, rows * FFN, st)?;
+        self.lin(sc.g.dev() + oh, &w("ffn.2"), sc.y.dev() + o2, rows, DIM, FFN)?;
+        check(unsafe { w21_residual_gate(p(sc.x.dev() + o4), 0, p(sc.y.dev() + o2), p(e(5)), p(sc.x.dev() + o4), rows as i64,
+                                         DIM as i64, st) }, "residual ffn")?;
+        self.head_rows(r0, rows)
+    }
+    /// GPU 0's side of its last block's split: its rows, then the other GPU's head rows.
+    fn last_block_split(&self, sp: &AttnSplit, ctx: &PassContext) -> Result<()> {
+        let (st, sc, s) = (self.s(), &self.sc, self.grid.tokens());
+        let (o2, bytes) = ((sp.rows.1 * DIM * 2) as u64, (s - sp.rows.1) * DIM * 2);
+        let take = |to: u64, from: u64| check(unsafe {
+            crate::cuda::memcpy_peer(to, sp.device, from, sp.peer_device, bytes, st) }, "last block rows from the other GPU");
+        let [k, v, k_img, v_img] = Self::context_kv(ctx, LAYERS - 1);
+        self.last_block_rows(sp, [k, v], [k_img, v_img], || {
+            sp.sent[2].record(st)?;
+            sp.meet.meet()?;
+            // GPU 1 has recorded its keys and values (`peer_sent[2]`) before the second meeting.
+            sp.meet.meet()?;
+            sp.peer_sent[2].wait_on(st)?;
+            take(sc.kr.dev() + o2, sp.peer[0] + o2)?;
+            take(sc.v.dev() + o2, sp.peer[1] + o2)
+        })?;
+        sp.meet.meet()?;
+        sp.peer_sent[3].wait_on(st)
+    }
+    /// GPU 1, after its own pass: its rows of GPU 0's last block and head, into GPU 0's head output.
+    /// GPU 0's block input, keys and values are read once GPU 0 records `peer_sent[2]`.
+    pub fn peer_last_block(&self, ctx: &PassContext) -> Result<()> {
+        let sp = self.split.as_ref().filter(|sp| !sp.main).ok_or("Wan GPU 1 split missing")?;
+        let text = sp.last_text.as_ref().ok_or("Wan GPU 1 last-block text keys missing")?;
+        let (st, sc) = (self.s(), &self.sc);
+        let (r0, r1) = sp.rows;
+        let rows = r1 - r0;
+        let take = |to: u64, from: u64, bytes: usize| check(unsafe {
+            crate::cuda::memcpy_peer(to, sp.device, from, sp.peer_device, bytes, st) }, "last block input from GPU 0");
+        sp.meet.meet()?;
+        sp.peer_sent[2].wait_on(st)?;
+        let (o2, o4) = ((r0 * DIM * 2) as u64, (r0 * DIM * 4) as u64);
+        take(sc.x.dev() + o4, sp.peer[2] + o4, rows * DIM * 4)?;
+        take(sc.xm.dev() + o2, sp.peer[5] + o2, rows * DIM * 2)?;
+        take(sc.kr.dev(), sp.peer[0], r0 * DIM * 2)?;
+        take(sc.v.dev(), sp.peer[1], r0 * DIM * 2)?;
+        let [_, _, k_img, v_img] = Self::context_kv(ctx, LAYERS - 1);
+        self.last_block_rows(sp, [text[0].dev(), text[1].dev()], [k_img, v_img], || {
+            sp.sent[2].record(st)?;
+            sp.meet.meet()
+        })?;
+        let head = (r0 * 64 * 4) as u64;
+        check(unsafe { crate::cuda::memcpy_peer(sp.peer[6] + head, sp.peer_device, sc.head.dev() + head, sp.device, rows * 64 * 4, st) },
+              "head rows to GPU 0")?;
+        sp.sent[3].record(st)?;
+        sp.meet.meet()
     }
 }
