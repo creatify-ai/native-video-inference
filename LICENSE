@@ -61,6 +61,17 @@ Agreement adds no terms to them:
   - models/minimax_h3_official/: MiniMax H3 Community License Agreement (see its LICENSE and
     NOTICE files). Using it requires Your own license to MiniMax H3, under that agreement or a
     separate agreement with MiniMax.
+    Upstream territory notice: the Community License excludes the European Union, the United
+    Kingdom, the Republic of Korea and the United States of America from its Applicable Territory.
+    Its grants of rights and redistribution permissions are limited to that Applicable Territory;
+    Section V.4 also limits use, reproduction, modification, distribution and display of H3 works
+    and outputs to that territory. Activities outside the upstream grant require separate permission
+    from MiniMax that covers the relevant activities and territories. Contact api@minimax.io.
+    Authorization from Creatify does not replace authorization from MiniMax. This notice does not
+    establish that the publisher or any recipient has obtained separate H3 redistribution rights.
+    This is a summary; the complete upstream agreement, including Exhibit A, governs:
+    models/minimax_h3_official/LICENSE
+    https://huggingface.co/MiniMaxAI/MiniMax-H3/raw/42ed227ee7df40d41602854ae760620d6eb651fe/LICENSE
   - models/ltx25/: LTX-2.x Community License Agreement of Lightricks Ltd. (see its LICENSE),
     including Attachment A.
   - vendor/native-tokenizers/: Apache License 2.0 (Hugging Face tokenizers).

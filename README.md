@@ -213,5 +213,12 @@ Wan 2.1 or LTX-2.x weights or their derivatives. Before running H3, make sure yo
 the MiniMax H3 Community License (including its territory and revenue terms) or a separate agreement
 with MiniMax; the same applies to LTX-2.x with Lightricks.
 
+**H3 territory restrictions.** The H3 Community License excludes the European Union, the United
+Kingdom, the Republic of Korea and the United States of America from its Applicable Territory,
+and limits both use and redistribution. Activities outside its grant require separate permission
+from MiniMax covering the relevant activities and territories (api@minimax.io). Authorization
+from Creatify does not replace that permission. See the complete [H3 license](models/minimax_h3_official/LICENSE);
+this notice does not establish that separate H3 redistribution rights have been obtained.
+
 Third-party attributions are in [licenses/NOTICE.md](licenses/NOTICE.md). Model weights are not
 distributed here and remain under their own licenses.
