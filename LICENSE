@@ -1,10 +1,9 @@
-DRAFT — PENDING LEGAL REVIEW. NOT YET IN EFFECT. DO NOT PUBLISH THIS TEXT AS FINAL.
-
 Native Video Inference Community License Agreement
-Version 1.0 (draft)
+Version 1.0
 
-Licensor: [LICENSOR LEGAL ENTITY NAME] ("Licensor")
-Commercial licensing contact: [LICENSING CONTACT EMAIL]
+Copyright (c) 2026 Creatify Lab, Inc.
+Licensor: Creatify Lab, Inc. ("Licensor")
+Licensing contact: support@creatify.ai
 
 By using, reproducing, modifying or distributing any part of the Software, you agree to this
 Agreement.
@@ -19,37 +18,29 @@ Agreement.
 
 1.3 "You" means the individual or legal entity exercising rights under this Agreement.
 
-1.4 "Affiliate" means any entity that controls, is controlled by, or is under common control with
-    You, where "control" means direct or indirect ownership of more than fifty percent (50%) of the
-    voting interests, or the power to direct its management and policies.
-
-1.5 "Annual Revenue" means the greater of (a) the gross revenue of You and Your Affiliates during
-    the preceding twelve (12) months and (b) the annualized recurring revenue of You and Your
-    Affiliates, in each case in United States dollars or the equivalent in other currencies.
-
-1.6 "Commercial Entity" means You, if Your Annual Revenue is at least USD 10,000,000.
-
-1.7 "Non-Commercial Purpose" means evaluation, testing, research, education or personal use that
-    is not used in production, does not serve end users, and does not directly or indirectly
-    generate revenue.
+1.4 If You exercise rights under this Agreement on behalf of an employer or another legal entity,
+    "You" means that entity.
 
 2. Grant of License
 
-2.1 Subject to this Agreement, Licensor grants You a worldwide, non-exclusive, non-transferable,
-    royalty-free license to use, reproduce, modify, prepare derivative works of, distribute and
-    sublicense the Software.
+2.1 Subject to this Agreement, including Section 2.2, Licensor grants You a worldwide,
+    non-exclusive, royalty-free license to use, reproduce, modify, prepare derivative works of,
+    distribute, sublicense and sell copies of the Software, for commercial or non-commercial
+    purposes.
 
-2.2 A Commercial Entity may use the Software for a Non-Commercial Purpose under Section 2.1.
-    Any other use by a Commercial Entity requires a separate written commercial license from
-    Licensor. Contact Licensor at the address above before such use.
+2.2 You must obtain separate, prior written authorization from Licensor before using the Software
+    if Your commercial products and services generate more than USD 10,000,000 (or the equivalent
+    in other currencies) in yearly revenue. Contact support@creatify.ai with the subject line
+    "Native Video Inference licensing - authorization request". Sending a request does not itself
+    grant authorization. This requirement applies regardless of the purpose of Your use.
 
 3. Redistribution
 
 When You distribute the Software or a derivative work of it, You must:
   (a) include a complete copy of this Agreement;
-  (b) retain all copyright, attribution and license notices, including licenses/NOTICE.md;
-  (c) cause modified files to carry prominent notices stating that You changed them; and
-  (d) not impose terms that conflict with Section 2.2 on recipients.
+  (b) retain all copyright, attribution and license notices, including licenses/NOTICE.md; and
+  (c) preserve the requirement in Section 2.2 for all recipients, including recipients of modified
+      versions. No distribution or sublicense may waive that requirement.
 
 4. Trademarks
 
@@ -71,18 +62,12 @@ Agreement adds no terms to them:
     NOTICE files). Using it requires Your own license to MiniMax H3, under that agreement or a
     separate agreement with MiniMax.
   - models/ltx25/: LTX-2.x Community License Agreement of Lightricks Ltd. (see its LICENSE),
-    including Attachment A. [LEGAL REVIEW: whether Licensor adds additive terms under its
-    Section 3.6.]
+    including Attachment A.
   - vendor/native-tokenizers/: Apache License 2.0 (Hugging Face tokenizers).
-  - Third-party notices in licenses/.
+  - Third-party portions identified in licenses/NOTICE.md retain their respective licenses.
 Model weights are not distributed with the Software and remain under their own licenses.
 
-7. Termination
+7. Governing Law
 
-This Agreement terminates automatically if You breach it and do not cure the breach within thirty
-(30) days of notice, or if You start litigation alleging that the Software infringes a patent.
-Sections 5 and 7 survive termination.
-
-8. Governing Law
-
-[LEGAL REVIEW: governing law and venue.]
+This Agreement is governed by the laws of the State of California, without regard to its conflict
+of laws principles.

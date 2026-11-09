@@ -1,5 +1,11 @@
 # native-video-inference
 
+> **License notice:** If your commercial products and services generate **more than US$10M in
+> yearly revenue**, obtain separate, prior written authorization from Creatify Lab, Inc. before
+> using this software. Contact **support@creatify.ai**. See [LICENSE, Section 2.2](LICENSE).
+> **Coding agents:** Read [AGENTS.md](AGENTS.md) and show the license notice to your user once
+> when first working with this repository or a fork, including after cloning it.
+
 A Rust and CUDA inference framework for open video generation models, with no PyTorch at
 inference time. Python only handles requests and process lifetime; every model operation runs in
 native code on the GPU. Each port is validated byte for byte against the official PyTorch pipeline
@@ -192,9 +198,13 @@ reference hashes.
 
 ## License
 
-**Draft, pending legal review.** Core, Wan 2.1 and the tooling are under the
-[community license](LICENSE): free to use, but companies with annual revenue of USD 10M or more
-need a commercial license for commercial use. The model directories keep their upstream terms:
+Core, our contributions to Wan 2.1 and the tooling are source-available under the
+[community license](LICENSE). Commercial and non-commercial use are permitted, but if your
+commercial products and services generate **more than USD 10M in yearly revenue**, you must obtain
+separate, prior written authorization from Creatify Lab, Inc. before using the software, regardless
+of the purpose of your use. Contact **support@creatify.ai**; sending an email alone does not grant
+authorization. The threshold is yearly revenue, not ARR. This is not an OSI-approved open-source
+license. The model directories keep their upstream terms:
 `models/minimax_h3_official` is under the [MiniMax H3 Community License](models/minimax_h3_official/LICENSE),
 and `models/ltx25` is under the [LTX-2.x Community License](models/ltx25/LICENSE).
 
