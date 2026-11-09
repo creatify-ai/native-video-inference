@@ -42,8 +42,9 @@ January 5, 2026). This is a summary, not legal advice; read the agreement:
 - Section 6 forbids removing or disabling the safety and transparency features of the model and
   its outputs.
 
-The weights are not distributed here. This repository's own license is still pending; see the
-[top-level README](../../README.md) and the [third-party notices](../../licenses/NOTICE.md).
+The weights are not distributed here. This directory keeps the upstream agreement; the
+repository's community license adds no terms to it. See the [top-level README](../../README.md)
+and the [third-party notices](../../licenses/NOTICE.md).
 
 ## Profiles
 
