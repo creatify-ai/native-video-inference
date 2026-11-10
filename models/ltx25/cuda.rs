@@ -22,12 +22,33 @@ extern "C" {
                            stream: Stream) -> c_int;
     fn cudaGetLastError() -> c_int;
     fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> c_int;
-    fn cudaStreamBeginCapture(stream: Stream, mode: c_int) -> c_int;
-    fn cudaStreamEndCapture(stream: Stream, graph: *mut *mut c_void) -> c_int;
-    fn cudaGraphInstantiate(exec: *mut *mut c_void, graph: *mut c_void, flags: u64) -> c_int;
-    fn cudaGraphLaunch(exec: *mut c_void, stream: Stream) -> c_int;
-    fn cudaGraphExecDestroy(exec: *mut c_void) -> c_int;
-    fn cudaGraphDestroy(graph: *mut c_void) -> c_int;
+    fn cudaEventCreateWithFlags(event: *mut *mut c_void, flags: c_uint) -> c_int;
+    fn cudaEventRecord(event: *mut c_void, stream: Stream) -> c_int;
+    fn cudaStreamWaitEvent(stream: Stream, event: *mut c_void, flags: c_uint) -> c_int;
+    fn cudaEventDestroy(event: *mut c_void) -> c_int;
+}
+
+/// A point on one device's stream that another device's stream can wait for.
+pub(crate) struct Event(*mut c_void);
+// The handle is an opaque driver object; recording and waiting are thread-safe CUDA calls.
+unsafe impl Send for Event {}
+impl Event {
+    /// Records the work queued on `stream` so far (timing disabled).
+    pub(crate) fn record(stream: Stream) -> Result<Self> {
+        let mut event = std::ptr::null_mut();
+        check(unsafe { cudaEventCreateWithFlags(&mut event, 2) }, "cudaEventCreateWithFlags")?;
+        let value = Self(event);
+        check(unsafe { cudaEventRecord(value.0, stream) }, "cudaEventRecord")?;
+        Ok(value)
+    }
+    pub(crate) fn handle(&self) -> usize { self.0 as usize }
+}
+impl Drop for Event {
+    fn drop(&mut self) { unsafe { cudaEventDestroy(self.0); } }
+}
+/// Makes `stream`'s later work wait for an event recorded on any device.
+pub(crate) fn wait_event(stream: Stream, event: usize) -> Result<()> {
+    check(unsafe { cudaStreamWaitEvent(stream, event as *mut c_void, 0) }, "cudaStreamWaitEvent")
 }
 
 /// Enables access from the calling thread's device to `peer`'s memory (already enabled is fine).
@@ -82,9 +103,7 @@ pub struct Device { pub stream: Stream, pub index: i32,
     asset_uploads:std::cell::Cell<(usize,usize)>,
     pub(crate) host_assets:Option<std::rc::Rc<native_core_infra::immutable_assets::ImmutableAssets>>,
     kernels:std::cell::RefCell<std::collections::BTreeMap<(std::path::PathBuf,String),std::rc::Rc<crate::triton::Kernel>>>,
-    pool:std::cell::RefCell<std::rc::Rc<AllocationPool>>,capturing:std::cell::Cell<bool>,
-    /// Bumped whenever cached weights may leave the device (a capture addressing them is then stale).
-    pub(crate) weight_generation:std::cell::Cell<u64>,
+    pool:std::rc::Rc<AllocationPool>,
     context:Option<native_core_infra::device_context::PrivateContext> }
 impl Device {
     /// Device 0 must be a B200 (sm_100); the gold kernels are sm_100a binaries.
@@ -112,13 +131,10 @@ impl Device {
         Ok(Self { stream, index,weights:std::cell::RefCell::new(std::collections::BTreeMap::new()),
             uploads:std::cell::RefCell::new(Vec::new()),asset_uploads:std::cell::Cell::new((0,0)),host_assets:None,
             kernels:std::cell::RefCell::new(std::collections::BTreeMap::new()),
-            pool:std::cell::RefCell::new(AllocationPool::new(TRANSIENT_POOL_BYTES,1<<16)),
-            capturing:std::cell::Cell::new(false),weight_generation:std::cell::Cell::new(0),context })
+            pool:AllocationPool::new(TRANSIENT_POOL_BYTES,1<<16),context })
     }
     pub fn sync(&self) -> Result<()> {
         if let Some(context)=&self.context{context.check_current()?;}
-        // Captured work only runs when its graph launches; there is nothing to wait for yet.
-        if self.capturing.get(){return Ok(());}
         check(unsafe { cudaStreamSynchronize(self.stream) }, "cudaStreamSynchronize")?;
         for lease in self.uploads.borrow().iter(){lease.wait()?;}
         self.uploads.borrow_mut().clear();Ok(())
@@ -130,16 +146,15 @@ impl Device {
     pub(crate) fn record_asset_upload(&self,bytes:usize){let(n,b)=self.asset_uploads.get();self.asset_uploads.set((n+1,b+bytes));}
     pub(crate) fn asset_upload_counts(&self)->(usize,usize){self.asset_uploads.get()}
     pub fn clear_weight_cache(&self)->Result<()>{
-        self.sync()?;self.weights.borrow_mut().clear();self.weight_generation.set(self.weight_generation.get()+1);Ok(())
+        self.sync()?;self.weights.borrow_mut().clear();Ok(())
     }
     pub(crate) fn evict_checkpoint(&self,path:&std::path::Path)->Result<()>{
         self.sync()?;let prefix=format!("{}\0",path.display());
         self.weights.borrow_mut().retain(|key,_|!key.starts_with(&prefix));
-        self.weight_generation.set(self.weight_generation.get()+1);
         self.trim_pool();Ok(())
     }
     /// Frees every cached transient (the stream must be idle: callers synchronize first).
-    fn trim_pool(&self){for pointer in self.pool.borrow().free.borrow_mut().drain(){unsafe{cudaFree(pointer);}}}
+    fn trim_pool(&self){for pointer in self.pool.free.borrow_mut().drain(){unsafe{cudaFree(pointer);}}}
     pub fn uuid(&self)->Result<String>{native_core_infra::device_context::device_uuid(self.index)}
     /// This device's private context, for peer copies issued on other threads.
     pub(crate) fn context_identity(&self)->Result<usize>{
@@ -166,59 +181,28 @@ impl Device {
         self.kernels.borrow_mut().insert(key,value.clone());Ok(value)
     }
     pub(crate) fn kernel_count(&self)->usize{self.kernels.borrow().len()}
-    pub(crate) fn pool_bytes(&self)->usize{self.pool.borrow().free.borrow().bytes()}
+    pub(crate) fn pool_bytes(&self)->usize{self.pool.free.borrow().bytes()}
     pub(crate) fn transient(&self,bytes:usize)->Result<Buffer>{
         if self.context.is_none(){return Buffer::new(bytes);}
         // All users run on this device's one private, non-blocking stream.
         // Reuse does not retain tensor contents: poisoned() reinitializes the
         // entire allocation on that same stream before its next use.
-        let pool=self.pool.borrow().clone();
+        let pool=&self.pool;
         let ptr=pool.free.borrow_mut().take(bytes.max(1));
         let mut value=match ptr{
             Some(ptr)=>Buffer{ptr,bytes,pool:None},
             // Cached blocks of other sizes may hold the memory: return them and retry once.
             None=>match Buffer::new(bytes){
                 Ok(value)=>value,
-                Err(_) if pool.free.borrow().entries()>0 && !self.capturing.get()=>{
+                Err(_) if pool.free.borrow().entries()>0=>{
                     unsafe{cudaGetLastError();}  // the failed cudaMalloc's error is not a later launch's
                     self.sync()?;self.trim_pool();Buffer::new(bytes)?
                 }
                 Err(e)=>return Err(e),
             },
         };
-        value.pool=Some(std::rc::Rc::downgrade(&pool));Ok(value)
+        value.pool=Some(std::rc::Rc::downgrade(pool));Ok(value)
     }
-    /// Records `body`'s work on this device's stream as a CUDA graph instead of running it. Its
-    /// transients come from a pool of their own that the graph keeps: the graph's addresses are never
-    /// handed to other work, and its tensors may be reused only inside it (stream order, as eager).
-    /// Synchronizations inside `body` are skipped (nothing has run); downloads or uploads fail.
-    pub(crate) fn capture<T>(&self,body:impl FnOnce()->Result<T>)->Result<(T,Graph)>{
-        if self.capturing.get(){return Err("nested CUDA graph capture".into());}
-        self.sync()?;
-        let own=AllocationPool::new(usize::MAX/2,1<<20);
-        let previous=self.pool.replace(own.clone());
-        self.capturing.set(true);
-        let begun=check(unsafe{cudaStreamBeginCapture(self.stream,2)},"cudaStreamBeginCapture");  // relaxed: pool cudaMalloc stays allowed
-        let result=if begun.is_ok(){body()}else{Err("capture did not begin".into())};
-        let mut graph=std::ptr::null_mut();
-        let ended=if begun.is_ok(){check(unsafe{cudaStreamEndCapture(self.stream,&mut graph)},"cudaStreamEndCapture")}else{begun};
-        self.capturing.set(false);
-        self.pool.replace(previous);
-        let value=result?;ended?;
-        let mut exec=std::ptr::null_mut();
-        let instantiated=check(unsafe{cudaGraphInstantiate(&mut exec,graph,0)},"cudaGraphInstantiate");
-        unsafe{cudaGraphDestroy(graph);}
-        instantiated?;
-        Ok((value,Graph{exec,stream:self.stream,_pool:own}))
-    }
-}
-/// An instantiated capture and the transients its kernels address.
-pub(crate) struct Graph {exec:*mut c_void,stream:Stream,_pool:std::rc::Rc<AllocationPool>}
-impl Graph {
-    pub(crate) fn launch(&self)->Result<()>{check(unsafe{cudaGraphLaunch(self.exec,self.stream)},"cudaGraphLaunch")}
-}
-impl Drop for Graph {
-    fn drop(&mut self){unsafe{cudaStreamSynchronize(self.stream);cudaGraphExecDestroy(self.exec);}}
 }
 impl Drop for Device {
     fn drop(&mut self) { unsafe { cudaStreamSynchronize(self.stream); }self.weights.get_mut().clear();

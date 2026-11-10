@@ -20,9 +20,9 @@ PyTorch. Prompt, seed and image change per request.
 measures the cold start of a prepared profile's own request on 30 fresh containers, at most ten at a
 time, each stopped at its first DiT step, and prints the P50 and P90.
 
---gpus 2 runs on a B200:2 container: the second GPU runs DiT blocks 24-47 of every forward. It
-copies those blocks from the first GPU over the peer link, so the Volume is read once, as with one
-GPU. Works with --cold-start too.
+--gpus 2 runs on a B200:2 container: the DiT blocks run sequence parallel, each GPU taking half of
+the video tokens. The second GPU copies the blocks from the first over the peer link, so the Volume
+is read once, as with one GPU. Works with --cold-start too.
 
 Settings: LTX25_VOLUME (default ltx25-native), LTX25_MOUNT (default /vol; profiles record absolute
 paths under it, so keep it fixed for a Volume), LTX25_HF_SECRET (a Modal Secret with HF_TOKEN),
@@ -377,7 +377,7 @@ def main(prompt: str = "", image: str = "", seed: int = 42, width: int = 1472, h
          fps: int = 24, out: str = "ltx25.mp4", cold_start: int = 0, gpus: int = 1):
     """One request. Without --prompt, replay the profile's capture request and check it against the reference.
     --cold-start N instead measures the cold start of the profile's own request on N fresh containers.
-    --gpus 2 runs DiT blocks 24-47 on a second GPU."""
+    --gpus 2 runs the DiT blocks sequence parallel on two GPUs."""
     if gpus not in GPUS:
         raise SystemExit("--gpus must be 1 or 2")
     mode = "i2v" if image else "t2v"

@@ -140,13 +140,14 @@ and loading, produce the reference's exact bytes. See [fast cold start](../../do
 ## Performance
 
 On one B200, with the default T2V profile (1472×832, 49 frames) and the weights on the GPU, a request
-that follows another in the same process (`LTX25_REPEAT=2`) takes 6.7–8 s:
+that follows another in the same process (`LTX25_REPEAT=2`) takes 7.4–8.4 s; on two B200s
+(`LTX25_WORLD_SIZE=2`, sequence parallel), 7.1–8.3 s:
 
-| Phase | Time |
-| --- | ---: |
-| Gemma 4 text encoder and connectors | 0.1 s |
-| stage 1 (8 steps), latent upsampler, stage 2 (3 steps) | 1.7 s |
-| final latents written, from receiving the request | 1.8 s |
+| Phase | One B200 | Two B200s |
+| --- | ---: | ---: |
+| Gemma 4 text encoder and connectors | 0.1 s | 0.1 s |
+| stage 1 (8 steps), latent upsampler, stage 2 (3 steps) | 1.8–2.0 s | 1.5–1.6 s |
+| final latents written, from receiving the request | 1.9–2.1 s | 1.5–1.7 s |
 | diffusion video VAE (2.9 s of it NATTEN), audio VAE and vocoder | 4.0 s |
 | frames, waveform and MP4 written | 0.9–2 s |
 
@@ -158,28 +159,41 @@ they compute:
   sequence (each op's expression and bf16 rounding unchanged; `LTX25_FUSE=0` runs every node on its
   own). `LTX25_KERNEL_CACHE=DIR` keeps the compiled kernels for later processes; the Modal example
   sets it to a directory on its Volume.
-- Each sampling stage records one forward as a CUDA graph and replays it for the later steps and
-  for later requests of the profile (`LTX25_CUDA_GRAPHS=0` runs every forward eagerly).
+- Sampling forwards are launched eagerly, without CUDA graphs, and the 48 blocks of a forward are
+  issued without a synchronization between them: the host issues the next block while the GPU runs
+  this one. The forwards are small (2,093 video tokens in stage 1, 8,372 in stage 2), so host time per
+  node matters, and the host work per node is cut down: each forward plans the block program once
+  for its 48 blocks, profile programs are parsed once per process, fused elementwise kernels are found
+  by their structure instead of their generated source, and cuBLASLt keeps each GEMM shape's
+  descriptors and heuristic choice. In one container on one B200, the two stages took 1.8–2.0 s this
+  way, 2.15–2.18 s with a synchronization after every block, and 1.71–1.73 s replaying one recorded
+  CUDA graph per stage (removed on 2026-11-08). On a host with slower CPUs, eager forwards took up to
+  2.9 s.
 - Freed activations stay in a pool of up to 96 GiB for reuse by size, so the decoder's temporaries
   are not freed and reallocated.
 
-Compared with [SGLang](https://github.com/sgl-project/sglang) 0.5.22 (`sglang serve --model-path
-Lightricks/LTX-2.5-Diffusers --pipeline-class-name LTX2TwoStagePipeline`, `--num-gpus 2` on two,
-which runs sequence parallel) in one container: SGLang's server for two requests, then `ltx25 infer`
-with `LTX25_REPEAT=2`, the same prompt and seed, in two alternating rounds. For the warm request,
-SGLang's column is its text encoding and two stages; ours is from receiving the request to the final
-latents, the same work:
+Compared with [SGLang](https://github.com/sgl-project/sglang) 0.5.22, run unmodified (`sglang serve
+--model-path Lightricks/LTX-2.5-Diffusers --pipeline-class-name LTX2TwoStagePipeline`), performance is
+comparable. Both ran in one B200:2 container on 2026-11-09, alternating, with the same prompt, seed and
+size. Each warm request is timed from the request to its final latents. For SGLang that is the sum of
+its own logged stage times before decoding; for us it is `ltx25 infer` with `LTX25_REPEAT=3`. Decoding
+is not counted on either side:
 
-| One container | native-video-inference | SGLang 0.5.22 |
+| One container, warm request | native-video-inference | SGLang 0.5.22 |
 | --- | ---: | ---: |
-| One B200 | 1.80–1.81 s | 2.75–2.83 s |
-| Two B200s | 1.80–1.85 s | 1.93–1.96 s |
+| One B200, 49 frames | 1.92–2.22 s | 2.57–2.61 s |
+| One B200, 57 frames | 2.19–2.23 s | 2.65–2.83 s |
 
-Every native round's latents had the reference's hashes. SGLang's default skips LTX 2.5's diffusion
-video decoder and decodes the latents once with the VAE, so its request takes 4.0–6.0 s but its
-frames are not the official pipeline's; ours take 6.6–7.6 s with that decoder. With the official
-decoder (`--load-diffusion-decoder` and `use_diffusion_decoder`), SGLang's request took 114.5 s on
-one B200 and 110.3 s on two.
+Every native request's outputs had the reference's hashes. On two GPUs, SGLang rounds the request's
+latent frames up to a multiple of the GPU count, so 49 frames become 57. Its two-GPU time in that
+container, 3.8–3.9 s, is slower than its own one-GPU time, which suggests our two-GPU SGLang setup was
+not right. We therefore claim no two-GPU comparison; natively, two B200s took 1.6–2.2 s for 57 frames.
+
+SGLang's output is not the official pipeline's: it samples with deterministic Euler instead of Euler
+ancestral, and draws different noise. By default it also decodes the latents once with the VAE instead
+of LTX 2.5's diffusion video decoder. That decoder (`--load-diffusion-decoder`, `use_diffusion_decoder`)
+needs NATTEN, which has no wheel for SGLang's torch 2.14; without it, SGLang falls back to
+`flex_attention` and a request takes about 110 s.
 
 ## GPU and host
 
@@ -187,13 +201,17 @@ One or two NVIDIA B200s. Kernels are compiled for `sm_100a` only. The build and 
 x86-64. The Modal example reserves 16 CPUs and 192 GiB of host RAM, as for `prepare`. The 22B
 transformer alone is about 44 GB in BF16.
 
-With `LTX25_WORLD_SIZE=2` (`--gpus 2` in the example), the second GPU copies the transformer's
-blocks 24-47 (18.6 GB) from the first over the peer link in about 45 ms. With CUDA graphs (the
-default), sampling then runs all 48 blocks on the first GPU from its replayed graphs, as one GPU does:
-two halves that run one after the other would be slower than one replayed forward. With
-`LTX25_CUDA_GRAPHS=0`, every forward splits 24/24, the second GPU running blocks 24-47 and the first
-everything else; block activations cross as exact copies. Either way the output is byte-identical to
-one GPU's.
+With `LTX25_WORLD_SIZE=2` (`--gpus 2` in the example), the second GPU copies the transformer's 48
+blocks from the first over the peer link and the blocks run sequence parallel: each GPU takes half of
+the video tokens (the first one the odd token) through all 48 blocks of every forward, while the
+audio tokens and the text context stay whole on both. Only video self-attention and audio-to-video
+attention read other tokens' keys: before them, each GPU copies the other's keys and values over the
+peer link, ordered by CUDA events. The input projections, output heads, sampler and decoders run on
+the first GPU. On B200 with the pinned cuBLAS and cuDNN, GEMMs over a token range and cuDNN attention
+over a query range or with gathered keys give the same bits as over all tokens, so the output is
+byte-identical to one GPU's. Each GPU runs the traced block program at its own token count: the
+profile traces the block at both stages' token counts, and every integer that differs between the two
+traces is the token count times a constant (`sp.rs` rejects a profile where it is not).
 
 ## Command line
 

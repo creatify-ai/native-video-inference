@@ -44,10 +44,6 @@ unsafe extern "C" {
     fn h3_conv_create(ctx:*mut *mut c_void)->c_int;
     fn h3_conv_prepare(ctx:*mut c_void,spec:*const ConvSpec,x:*const c_void,w:*const c_void,y:*mut c_void,stream:*mut c_void)->i32;
     fn h3v_dense_prepare(dims:*const i64,qs:*const i64,ks:*const i64,vs:*const i64,os:*const i64)->i32;
-    fn cudaStreamBeginCapture(stream:*mut c_void,mode:i32)->i32;
-    fn cudaStreamEndCapture(stream:*mut c_void,graph:*mut *mut c_void)->i32;
-    fn cudaGraphDestroy(graph:*mut c_void)->i32;
-    fn cudaGetLastError()->i32;
     fn h3_conv_forward(ctx:*mut c_void,spec:*const ConvSpec,x:*const c_void,w:*const c_void,y:*mut c_void,stream:*mut c_void)->c_int;
     fn h3_conv_error()->*const c_char;
     fn h3_conv_destroy(ctx:*mut c_void)->c_int;
@@ -241,7 +237,7 @@ impl Program{
         if pointer==0{return Err("VAE workspace is not prepared".into());}Ok(pointer+offset as u64)
     }
     fn run(&self,verify_boundaries:bool)->Result<()> { self.run_nodes(verify_boundaries,true) }
-    // Called only under CUDA stream capture. Register nodes; do not execute.
+    // Builds the convolution and attention plans of every node; launches nothing.
     fn prepare_metadata_plans(&self)->Result<()> {
         for op in arr(&self.manifest["ops"])? {
             if op["kind"]=="aten.convolution.default" {
@@ -262,7 +258,6 @@ impl Program{
         }
         Ok(())
     }
-    fn register_metadata_nodes(&self)->Result<()> { self.run_nodes(false,false) }
     fn run_nodes(&self,verify_boundaries:bool,synchronize:bool)->Result<()> {
         if verify_boundaries && self.spatial.active!=(256,256){
             return Err("small tile requires an independent shape-matched output reference".into());

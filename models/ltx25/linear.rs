@@ -17,9 +17,6 @@ extern "C" {
 
 pub struct Linear { handle: *mut c_void, stream:crate::cuda::Stream, _blas: Buffer, _lt: Buffer }
 impl Linear {
-    pub(crate) fn prepare(&self,shapes:&[native_core_infra::linear_prepare::Shape])->Result<()>{
-        unsafe{native_core_infra::linear_prepare::prepare(self.handle,shapes)}?;Ok(())
-    }
     pub fn bmm_nn(&self,left:&crate::tensor::Tensor,right:&crate::tensor::Tensor,out:&crate::tensor::Tensor)->Result<()>{
         use crate::tensor::contiguous_strides;
         if left.shape.len()!=2 || right.shape.len()!=3 || out.shape.len()!=3

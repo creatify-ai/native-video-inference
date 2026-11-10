@@ -196,12 +196,12 @@ extern "C" int q3_conv_cache_clear(void* context){
     catch(const std::exception& e){error=e.what();return -1;}
 }
 
-// Build the original patch-embedding plan and register its library kernels
-// in a discarded capture. No graph is instantiated or launched, no tensor is
-// read, and no model parameters are needed. The worker owns an independent
-// context until the serial conditioner adopts it before its first request.
+// Build the original patch-embedding plan and reserve its workspace. No kernel
+// is launched, no tensor is read, and no model parameters are needed. The
+// worker owns an independent context until the serial conditioner adopts it
+// before its first request.
 extern "C" int q3_conv_prepare_isolated(int device, int64_t rows, void** out) {
-    void* dummy = nullptr; cudaStream_t stream = nullptr; cudaGraph_t graph = nullptr;
+    void* dummy = nullptr; cudaStream_t stream = nullptr;
     std::unique_ptr<Context> ctx;
     try {
         if (!out || rows <= 0 || rows > 524288) throw std::runtime_error("invalid patch preparation rows");
@@ -223,17 +223,10 @@ extern "C" int q3_conv_prepare_isolated(int device, int64_t rows, void** out) {
         size_t workspace=0;for(const auto& entry:ctx->plans)workspace=std::max(workspace,size_t(entry.second->getWorkspaceSize()));
         if(workspace>(2ull<<30))throw std::runtime_error("patch metadata workspace exceeds preparation budget");
         ctx->reserve(workspace);
-        cuda_check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
-        forward(*ctx,spec,input,weight,output);
-        cuda_check(cudaStreamEndCapture(stream,&graph));
-        cuda_check(cudaGraphDestroy(graph));graph=nullptr;
         cuda_check(cudaStreamDestroy(stream));stream=nullptr;
         cuda_check(cudaFree(dummy));dummy=nullptr;
         *out=ctx.release();error.clear();return 0;
     } catch(const std::exception& e) {
-        if(stream){cudaStreamCaptureStatus status{};cudaStreamIsCapturing(stream,&status);
-            if(status!=cudaStreamCaptureStatusNone)cudaStreamEndCapture(stream,&graph);}
-        if(graph)cudaGraphDestroy(graph);
         if(stream)cudaStreamDestroy(stream);
         if(dummy)cudaFree(dummy);
         error=e.what();return -1;

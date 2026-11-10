@@ -13,10 +13,6 @@ int h3_linear_create(void* stream, void* blas_workspace, size_t blas_workspace_b
 void h3_linear_destroy(void* handle);
 int h3_linear_cublas_version(void* handle, int* version);
 const char* h3_linear_error(void);
-// Register representative Qwen backend nodes under stream capture. Never
-// launch or instantiate a graph; model parameters and outputs are untouched.
-int h3_linear_prepare_qwen(void* handle);
-
 // Contiguous row-major tensors: input[M,K], weight[N,K], bias[N], output[M,N].
 // dtype=0: BF16; dtype=1: FP32. bias=null selects the matching no-bias backend.
 // Enqueues on the context stream. No implicit synchronization or allocation of

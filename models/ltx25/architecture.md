@@ -121,27 +121,32 @@ model tensors and operations are the same in both lifetimes.
 
 ## Two GPUs
 
-`parallel.rs` runs DiT blocks 24-47 of every forward on GPU 1, on its own thread and private
-context, and GPU 0 runs everything else. Block activations cross as peer copies of their whole
-allocations (`device_context::copy_peer`), so each half runs exactly the one-GPU block graph.
+`parallel.rs` runs the 48 DiT blocks of every forward sequence parallel (`sp.rs`): GPU 0 and GPU 1,
+each on its own thread and private context, take one half of the video tokens through all blocks,
+and GPU 0 runs everything else. Each runs the block graph at its own token count, which `sp.rs`
+derives from the profile's two traced block graphs (every token-dependent integer is the token count
+times a constant). Inputs and outputs cross as peer copies (`device_context::copy_peer`). Before
+video self-attention and audio-to-video attention, each GPU copies the other's keys and values;
+CUDA events order the copies and one message per gather pairs the two threads.
 
 The one-request `infer` leaves GPU 0's startup as it is with one GPU and starts GPU 1 once GPU
 0's context is ready; creating both contexts at once delays GPU 0's first uploads. Once GPU 0's
 DiT is installed, GPU 1 warms the profile with GPU 0's parsed gold profile (`gold::Shared`, about
-40 ms) and copies its blocks from GPU 0's cache into one allocation of its own, so the checkpoint
-is read once and GPU 1 touches no files while GPU 0 reads. The native ABI instead has each GPU
-read its own half of the DiT (`second_partition`).
+40 ms) and copies the blocks from GPU 0's cache into one allocation of its own, so the checkpoint
+is read once and GPU 1 touches no files while GPU 0 reads. The native ABI instead has GPU 1 read
+the blocks itself (`peer_partition`).
 
 ## Preparation boundaries
 
-The model declares Gemma tokenizer preparation, text linear metadata and the
-processor attention layouts. The prefetch receipt reports
+The model declares Gemma tokenizer preparation and the processor attention
+layouts. The prefetch receipt reports
 `gpu_prepare_required=true` and completes only that declared preparation plus
 the weight copies. Its `preparation` field reports the shapes/plans actually
 prepared and `full_execution_prepared=false`.
 
-Triton module loading, native convolution plans/workspaces, sampler buffers and
-request activations keep their first-use lifetime. DiT uses compiled
+Text cuBLASLt algorithm selection and kernel loading, Triton module loading,
+native convolution plans/workspaces, sampler buffers and request activations
+keep their first-use lifetime. DiT uses compiled
 native/CUTLASS operators; it has no model-wide graph compilation step.
 No dummy inference is run.
 

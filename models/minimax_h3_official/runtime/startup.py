@@ -81,7 +81,7 @@ def components(config, inputs, has_video, directory):
         if name in ('video_encoder', 'audio_encoder'):
             environment['H3_MODEL_LOAD_ENCODER_READ_AHEAD'] = '1'
         if name.startswith('video_') and options.get('metadata_capture', True):
-            environment['H3_VAE_METADATA_CAPTURE'] = '1'
+            environment['H3_VAE_METADATA_PREPARE'] = '1'
         required = ['backend']
         if name == 'dit':
             required += ['condition-text', 'condition-assemble', 'request-shape-layout', 'request-layout']

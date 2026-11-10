@@ -91,12 +91,6 @@ pub fn run_parallel(gold:&Gold,aux:&Gold,checkpoint:&Checkpoint,stage:usize,sing
     let mut checks=Vec::new();let count=if single_step{1}else{
         native_core_infra::switch_benchmark::steps(steps,gold.verify)?
     };let mut draw=0;let mut unpatchified=Vec::new();
-    // Forwards after the stage's first replay one captured graph (same layouts every step). With
-    // graphs, a two-GPU session also runs every block on GPU 0 (loading blocks 24-47 there once):
-    // one replayed graph is faster than two halves that run one after the other.
-    let capture=forward::graphs_enabled() && !gold.verify;
-    let peer=if capture{None}else{peer};
-    let mut captured=if capture{forward::kept_capture(aux,stage,device)}else{None};
     let passed=(||->Result<bool>{
         for step in 0..count{
             let sigma=Tensor::contiguous_shape(vec![1],"torch.float32".into(),&device)?;
@@ -108,25 +102,9 @@ pub fn run_parallel(gold:&Gold,aux:&Gold,checkpoint:&Checkpoint,stage:usize,sing
                 keyframes:initial.and_then(|s|s[modality].keyframes.clone()),
             })};
             let inputs=[make_input(0)?,make_input(1)?];
-            if capture && step>=1 && captured.is_none(){
-                let Some(graph)=forward::CapturedForward::capture(gold,aux,checkpoint,stage,step,&inputs,contexts,device,linear)?
-                    else{return Ok(false);};
-                let graph=std::rc::Rc::new(graph);
-                forward::keep_capture(aux,stage,device,graph.clone());captured=Some(graph);
-            }
-            let velocity=if let Some(graph)=&captured{
-                // A kept capture replaces the eager first forward too: stamp the first-DiT marker
-                // (which the eager forward arms) on the stream before it.
-                if stage==0 && step==0{
-                    native_core_infra::execution_start::arm();
-                    native_core_infra::execution_start::enqueue_if_armed(device.stream)?;
-                }
-                graph.run(&inputs,contexts,device)?
-            }else{
-                let result=forward::run_with_contexts_parallel(gold,aux,checkpoint,stage,step,Some(&inputs),contexts,device,linear,peer)?;
-                checks.extend(result.checks);
-                let Some(velocity)=result.outputs else{return Ok(false);};velocity
-            };
+            let result=forward::run_with_contexts_parallel(gold,aux,checkpoint,stage,step,Some(&inputs),contexts,device,linear,peer)?;
+            checks.extend(result.checks);
+            let Some(velocity)=result.outputs else{return Ok(false);};
             for modality in 0..2{
                 // X0Model: materialize multiply and subtract in FP32, then
                 // round back to BF16 before the sampler's FP32 mask blend.

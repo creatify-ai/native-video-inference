@@ -57,7 +57,7 @@ on a warm Volume; two rounds of 30 per model:
 | LTX 2.5 T2V | 1472x832, 49 frames | 42.0 GB DiT + 26.2 GB Gemma + 2.5 GB VAE and upscaler | 7.8 s | 13.8 s |
 | MiniMax H3 FL2VA, `--gpus 2` | 768x768, 124 frames, prompt only | 51.6 GB Qwen + 2 × (20.1 GB DiT half + 2.8 GB) | 7.2 s | 14.0 s |
 | Wan 2.1 I2V-14B 720P, `--gpus 2` | the official example, 832x1104, 81 frames | 32.8 GB DiT + 14.4 GB encoders; the second GPU copies the DiT from the first | 7.4 s | 14.0 s |
-| LTX 2.5 T2V, `--gpus 2` | 1472x832, 49 frames | 42.0 GB DiT + 26.2 GB Gemma + 2.5 GB VAE and upscaler; the second GPU copies its half of the DiT from the first | 6.6 s | 14.4 s |
+| LTX 2.5 T2V, `--gpus 2` | 1472x832, 49 frames | 42.0 GB DiT + 26.2 GB Gemma + 2.5 GB VAE and upscaler; the second GPU copies the DiT from the first | 6.6 s | 14.4 s |
 
 Ref2VA (with Wan's example image as the reference) is four rounds, which varied most: P50 7.8, 10.2,
 15.4 and 8.9 s. Its own DiT files had been read far less often than FL2VA's.
@@ -66,13 +66,16 @@ Ref2VA (with Wan's example image as the reference) is four rounds, which varied 
 context-parallel ranks (FL2VA generates in 54 s instead of 80 s), and each rank reads only its half
 of the DiT, from the same files as one GPU. Wan runs the unconditional pass of classifier-free
 guidance on the second GPU (its 40 steps take 201 s instead of 400 s), which copies the DiT from the
-first over the peer link in about 40 ms. LTX's second GPU copies DiT blocks 24-47 (18.6 GB) from
-the first in about 45 ms; sampling replays CUDA graphs of all 48 blocks on the first GPU (with
-`LTX25_CUDA_GRAPHS=0`, every forward splits the blocks 24/24 instead). In each case the container reads about as much as one GPU
+first over the peer link in about 40 ms. LTX's second GPU copies the 48 DiT blocks from the first and
+runs them sequence parallel, each GPU taking half of the video tokens (a warm request's two sampling
+stages take 1.5–1.6 s instead of 1.8–2.0 s). In each case the container reads about as much as one GPU
 does. The two-GPU rows above are rounds 2 and 3; the first two-GPU round on these hosts had a P50 of
 11.3 s (H3), 10.1 s (Wan) and 7.5 s (LTX). LTX's two-GPU row was measured a day after its one-GPU
 row, on hosts that had read its files more often: 30 containers of each, started together, both had
-a P50 of 7.1 s.
+a P50 of 7.1 s. That row predates sequence parallelism, when the second GPU copied only blocks 24-47.
+On 2026-11-09, 30 containers of each build, started together, gave a two-GPU P50 of 6.5 s with
+sequence parallelism and 6.7 s without it. That was one round on hosts that had not cached the
+Volume, so the P90s were 22.3 s and 34.7 s.
 
 ### Warm Volumes
 
@@ -159,11 +162,10 @@ second in every container we traced. A first request costs natively about 0.5 s 
 native-video-inference reproduces the official pipeline's output byte for byte, on one GPU or two;
 SGLang's output differs from it.
 
-LTX 2.5 (T2V, 1472×832, 49 frames) is compared the same way, in one container, in its
-[README](models/ltx25/README.md#performance): a warm request's final latents are ready after
-1.80–1.81 s on one B200 and 1.80–1.85 s on two, against 2.75–2.83 s and 1.93–1.96 s for SGLang's
-text encoding and two stages; with the official diffusion video decoder, a request takes 6.6–7.6 s
-natively and 110–115 s with SGLang.
+LTX 2.5 (T2V, 1472×832, 49 frames) is compared in one container in its
+[README](models/ltx25/README.md#performance), against SGLang run unmodified. Timed from the request to
+the final latents, performance is comparable: 1.92–2.22 s natively against 2.57–2.61 s for SGLang on
+one B200. We claim no two-GPU comparison, because our two-GPU SGLang setup was not verified.
 
 ## How it is built
 

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -57,18 +58,6 @@ __global__ void count_mismatch(const uint32_t* a, const uint32_t* b, size_t word
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < words; i += size_t(gridDim.x) * blockDim.x) local += (a[i] != b[i]);
     if (local) atomicAdd(out, local);
 }
-struct Context {
-    Tuner* tuner = nullptr;
-    cublasHandle_t blas = nullptr;
-    cublasLtHandle_t lt = nullptr;
-    cudaStream_t stream = nullptr;
-    void* workspace = nullptr;
-    size_t workspace_bytes = 0;
-    bool tf32 = false;
-    bool reduced = true;
-    int (*fallback_policy)() = nullptr;
-    ~Context() { if (blas) cublasDestroy(blas); }
-};
 struct Descriptors {
     cublasLtMatmulDesc_t op = nullptr;
     cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
@@ -80,6 +69,30 @@ struct Descriptors {
         if (a) cublasLtMatrixLayoutDestroy(a);
         if (op) cublasLtMatmulDescDestroy(op);
     }
+};
+// The bias path's state for one GEMM: its descriptors and the algorithm cuBLASLt's heuristic chose.
+// The heuristic is a function of the descriptors and preferences (shape, data and compute types,
+// workspace, operand alignment), so it is queried once per key; the bias pointer is set per call.
+struct LtKey {
+    int m, n, k, dtype; uint32_t align[4];
+    bool operator<(const LtKey& o) const {
+        return std::tie(m,n,k,dtype,align[0],align[1],align[2],align[3]) <
+               std::tie(o.m,o.n,o.k,o.dtype,o.align[0],o.align[1],o.align[2],o.align[3]);
+    }
+};
+struct LtPlan { Descriptors desc; cublasLtMatmulAlgo_t algo{}; };
+struct Context {
+    Tuner* tuner = nullptr;
+    cublasHandle_t blas = nullptr;
+    cublasLtHandle_t lt = nullptr;
+    cudaStream_t stream = nullptr;
+    void* workspace = nullptr;
+    size_t workspace_bytes = 0;
+    bool tf32 = false;
+    bool reduced = true;
+    int (*fallback_policy)() = nullptr;
+    std::map<LtKey, std::unique_ptr<LtPlan>> lt_plans;
+    ~Context() { lt_plans.clear(); if (blas) cublasDestroy(blas); }
 };
 uint32_t alignment(const void* ptr) {
     uint32_t result = 256;
@@ -196,46 +209,57 @@ int forward_default(Context* ctx, const void* input, const void* weight,
     if(force_fallback || out_features==1 || in_features==1)
         return infra_linear_generic::fallback(ctx,input,weight,bias,output,rows,out_features,in_features,dtype,
             force_fallback ? infra_linear_generic::Forced : infra_linear_generic::SmallDimension);
-    const auto type = io_type(dtype);
-    const auto compute = dtype == 1 && ctx->tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
-    Descriptors desc;
-    BLAS(cublasLtMatmulDescCreate(&desc.op, compute, CUDA_R_32F));
-    const cublasOperation_t transa = CUBLAS_OP_T, transb = CUBLAS_OP_N;
-    BLAS(cublasLtMatmulDescSetAttribute(desc.op, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
-    BLAS(cublasLtMatmulDescSetAttribute(desc.op, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
-    const cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
-    BLAS(cublasLtMatmulDescSetAttribute(desc.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
-    BLAS(cublasLtMatmulDescSetAttribute(desc.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
-    BLAS(cublasLtMatrixLayoutCreate(&desc.a, type, k, m, lda));
-    BLAS(cublasLtMatrixLayoutCreate(&desc.b, type, k, n, ldb));
-    BLAS(cublasLtMatrixLayoutCreate(&desc.c, type, m, n, ldc));
-    BLAS(cublasLtMatmulPreferenceCreate(&desc.preference));
-    BLAS(cublasLtMatmulPreferenceSetAttribute(desc.preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-        &ctx->workspace_bytes, sizeof(ctx->workspace_bytes)));
-    if (dtype != 1 && !ctx->reduced) {
-        uint32_t mask = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE | CUBLASLT_REDUCTION_SCHEME_NONE;
-        BLAS(cublasLtMatmulPreferenceSetAttribute(desc.preference, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &mask, sizeof(mask)));
-    }
     const void* pointers[] = {weight, input, output, bias};
-    const cublasLtMatmulPreferenceAttributes_t attrs[] = {
-        CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
-        CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES};
-    for (int i = 0; i != 4; ++i) {
-        uint32_t value = alignment(pointers[i]);
-        BLAS(cublasLtMatmulPreferenceSetAttribute(desc.preference, attrs[i], &value, sizeof(value)));
+    const LtKey key{m, n, k, dtype, {alignment(pointers[0]), alignment(pointers[1]), alignment(pointers[2]), alignment(pointers[3])}};
+    auto found = ctx->lt_plans.find(key);
+    if (found == ctx->lt_plans.end()) {
+        auto plan = std::make_unique<LtPlan>();
+        Descriptors& desc = plan->desc;
+        const auto type = io_type(dtype);
+        const auto compute = dtype == 1 && ctx->tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+        BLAS(cublasLtMatmulDescCreate(&desc.op, compute, CUDA_R_32F));
+        const cublasOperation_t transa = CUBLAS_OP_T, transb = CUBLAS_OP_N;
+        BLAS(cublasLtMatmulDescSetAttribute(desc.op, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
+        BLAS(cublasLtMatmulDescSetAttribute(desc.op, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
+        const cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+        BLAS(cublasLtMatmulDescSetAttribute(desc.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+        BLAS(cublasLtMatmulDescSetAttribute(desc.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+        BLAS(cublasLtMatrixLayoutCreate(&desc.a, type, k, m, lda));
+        BLAS(cublasLtMatrixLayoutCreate(&desc.b, type, k, n, ldb));
+        BLAS(cublasLtMatrixLayoutCreate(&desc.c, type, m, n, ldc));
+        BLAS(cublasLtMatmulPreferenceCreate(&desc.preference));
+        BLAS(cublasLtMatmulPreferenceSetAttribute(desc.preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &ctx->workspace_bytes, sizeof(ctx->workspace_bytes)));
+        if (dtype != 1 && !ctx->reduced) {
+            uint32_t mask = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE | CUBLASLT_REDUCTION_SCHEME_NONE;
+            BLAS(cublasLtMatmulPreferenceSetAttribute(desc.preference, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &mask, sizeof(mask)));
+        }
+        const cublasLtMatmulPreferenceAttributes_t attrs[] = {
+            CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
+            CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES};
+        for (int i = 0; i != 4; ++i) {
+            uint32_t value = key.align[i];
+            BLAS(cublasLtMatmulPreferenceSetAttribute(desc.preference, attrs[i], &value, sizeof(value)));
+        }
+        cublasLtMatmulHeuristicResult_t heuristic{};
+        int count = 0;
+        auto heuristic_status=cublasLtMatmulAlgoGetHeuristic(ctx->lt, desc.op, desc.a, desc.b, desc.c, desc.c,
+            desc.preference, 1, &heuristic, &count);
+        if(heuristic_status==CUBLAS_STATUS_NOT_SUPPORTED)
+            return infra_linear_generic::fallback(ctx,input,weight,bias,output,rows,out_features,in_features,dtype,
+                infra_linear_generic::EmptyHeuristic);
+        if(heuristic_status!=CUBLAS_STATUS_SUCCESS)return fail("cublasLtMatmulAlgoGetHeuristic",int(heuristic_status));
+        if (count != 1) return infra_linear_generic::fallback(ctx,input,weight,bias,output,
+            rows,out_features,in_features,dtype,infra_linear_generic::EmptyHeuristic);
+        plan->algo = heuristic.algo;
+        found = ctx->lt_plans.emplace(key, std::move(plan)).first;
+    } else {
+        BLAS(cublasLtMatmulDescSetAttribute(found->second->desc.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
     }
-    cublasLtMatmulHeuristicResult_t heuristic{};
-    int count = 0;
-    auto heuristic_status=cublasLtMatmulAlgoGetHeuristic(ctx->lt, desc.op, desc.a, desc.b, desc.c, desc.c,
-        desc.preference, 1, &heuristic, &count);
-    if(heuristic_status==CUBLAS_STATUS_NOT_SUPPORTED)
-        return infra_linear_generic::fallback(ctx,input,weight,bias,output,rows,out_features,in_features,dtype,
-            infra_linear_generic::EmptyHeuristic);
-    if(heuristic_status!=CUBLAS_STATUS_SUCCESS)return fail("cublasLtMatmulAlgoGetHeuristic",int(heuristic_status));
-    if (count != 1) return infra_linear_generic::fallback(ctx,input,weight,bias,output,
-        rows,out_features,in_features,dtype,infra_linear_generic::EmptyHeuristic);
+    const Descriptors& desc = found->second->desc;
+    const cublasLtMatmulAlgo_t& algo = found->second->algo;
     auto lt_status=cublasLtMatmul(ctx->lt, desc.op, &alpha, weight, desc.a, input, desc.b, &beta,
-        output, desc.c, output, desc.c, &heuristic.algo, ctx->workspace, ctx->workspace_bytes, ctx->stream);
+        output, desc.c, output, desc.c, &algo, ctx->workspace, ctx->workspace_bytes, ctx->stream);
     if(lt_status==CUBLAS_STATUS_NOT_SUPPORTED)return infra_linear_generic::fallback(ctx,input,weight,bias,output,
         rows,out_features,in_features,dtype,infra_linear_generic::LtFailure);
     if(lt_status!=CUBLAS_STATUS_SUCCESS)return fail("cublasLtMatmul",int(lt_status));
@@ -435,32 +459,4 @@ extern "C" int infra_linear_pinned_report(void* handle, char* out, int size) {
     if (int(text.size()) + 1 > size) return -2;
     std::memcpy(out, text.c_str(), text.size() + 1);
     return 0;
-}
-
-// First-use library/module registration only. The graph is discarded without
-// instantiation or launch; the dummy allocation is never read or written.
-extern "C" int infra_linear_prepare(void* handle, const InfraLinearShape* shapes, size_t count, const char* label) {
-    auto* ctx=static_cast<Context*>(handle);
-    if(!ctx || (!shapes && count))return -1;
-    const auto started=std::chrono::steady_clock::now();
-    void* dummy=nullptr;
-    auto allocated=cudaMalloc(&dummy,1u<<20);
-    if(allocated!=cudaSuccess)return fail("metadata dummy allocation",int(allocated));
-    uint64_t counts[5];std::copy(infra_linear_generic::counts,infra_linear_generic::counts+5,counts);
-    int captures=0,errors=0;
-    auto capture=[&](int rows,int in,int out,bool bias){
-        auto begun=cudaStreamBeginCapture(ctx->stream,cudaStreamCaptureModeThreadLocal);
-        if(begun!=cudaSuccess){++errors;cudaGetLastError();return;}
-        int code=infra_linear_forward(handle,dummy,dummy,bias?dummy:nullptr,dummy,rows,out,in,0);
-        cudaGraph_t graph=nullptr;auto ended=cudaStreamEndCapture(ctx->stream,&graph);
-        if(graph)cudaGraphDestroy(graph);
-        if(code==0&&ended==cudaSuccess)++captures;else ++errors;
-        cudaGetLastError();
-    };
-    for(size_t i=0;i<count;++i)capture(shapes[i].rows,shapes[i].in_features,shapes[i].out_features,shapes[i].bias!=0);
-    std::copy(counts,counts+5,infra_linear_generic::counts);
-    cudaFree(dummy);
-    double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
-    std::fprintf(stderr,"%s seconds=%.6f captures=%d errors=%d graphs_launched=0\n",label?label:"NATIVE_LINEAR_METADATA",seconds,captures,errors);
-    return errors?-1:0;
 }

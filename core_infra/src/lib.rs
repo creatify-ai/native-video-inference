@@ -16,8 +16,6 @@ pub mod startup_native;
 pub mod declared_startup_gate;
 #[cfg(unix)]
 pub mod startup_ffi;
-#[cfg(feature="cuda")]
-pub mod linear_prepare;
 pub mod immutable_assets;
 pub mod backend_plans;
 pub mod resident_assets;

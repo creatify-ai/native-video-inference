@@ -355,12 +355,22 @@ fn component_program(path:&str)->Result<(std::rc::Rc<Value>,std::rc::Rc<BTreeSet
     Ok(value)
 }
 
-pub fn execute(graph:&Value,mut tensors:BTreeMap<String,Tensor>,device:&Device,linear:&Linear,
+/// Gathers attention operands across the GPUs of a sequence-parallel forward (`sp::Exchange`).
+pub(crate) trait SequenceGather {
+    fn gather(&self,locals:&[&Tensor],device:&Device)->Result<Vec<Tensor>>;
+}
+
+pub fn execute(graph:&Value,tensors:BTreeMap<String,Tensor>,device:&Device,linear:&Linear,
     verify_nodes:bool)->Result<(BTreeMap<String,Tensor>,Value)>{
+    execute_with(graph,tensors,device,linear,verify_nodes,None)
+}
+
+/// How `execute` runs a program: which nodes run fused, and after which node each value is released.
+/// It depends only on the program, so a caller that runs one program many times (the 48 blocks of
+/// a forward) plans it once.
+pub(crate) struct Plan {member:Vec<Option<usize>>,runs:Vec<FusedRun>,release:Vec<Vec<String>>,verify_nodes:bool}
+pub(crate) fn plan(graph:&Value,verify_nodes:bool)->Result<Plan>{
     let setup=host_profiling().then(std::time::Instant::now);
-    let mut comparisons=Vec::new();
-    let mut convolution=None;
-    let mut triton_kernels=BTreeMap::new();
     // Video VAE graphs contain full-resolution temporaries. Release an SSA
     // value after its last consumer; aliased storage stays alive through Rc.
     fn uses(value:&Value,index:usize,last:&mut BTreeMap<String,usize>){
@@ -389,6 +399,26 @@ pub fn execute(graph:&Value,mut tensors:BTreeMap<String,Tensor>,device:&Device,l
     let mut release=vec![Vec::new();nodes.len()];
     for (name,index) in last{if index<nodes.len(){release[index].push(name);}}
     if let Some(t)=setup{host_record("graph.setup",t);}
+    Ok(Plan{member,runs,release,verify_nodes})
+}
+
+/// `execute`, with the other GPU's tokens for attentions marked `sp_gather` (a local program of
+/// `sp::localize`).
+pub(crate) fn execute_with(graph:&Value,tensors:BTreeMap<String,Tensor>,device:&Device,linear:&Linear,
+    verify_nodes:bool,gather:Option<&dyn SequenceGather>)->Result<(BTreeMap<String,Tensor>,Value)>{
+    execute_planned(graph,&plan(graph,verify_nodes)?,tensors,device,linear,gather)
+}
+
+/// `execute_with` of a program planned by `plan` (for this same program).
+pub(crate) fn execute_planned(graph:&Value,plan:&Plan,mut tensors:BTreeMap<String,Tensor>,device:&Device,linear:&Linear,
+    gather:Option<&dyn SequenceGather>)->Result<(BTreeMap<String,Tensor>,Value)>{
+    let verify_nodes=plan.verify_nodes;
+    let (member,runs,release)=(&plan.member,&plan.runs,&plan.release);
+    let nodes=graph["nodes"].as_array().ok_or("graph nodes")?;
+    if member.len()!=nodes.len(){return Err("execution plan belongs to another program".into());}
+    let mut comparisons=Vec::new();
+    let mut convolution=None;
+    let mut triton_kernels=BTreeMap::new();
     for (index,node) in nodes.iter().enumerate(){
         let timer=host_profiling().then(std::time::Instant::now);
         let op=node["op"].as_str().ok_or("operator name")?;
@@ -744,6 +774,10 @@ pub fn execute(graph:&Value,mut tensors:BTreeMap<String,Tensor>,device:&Device,l
                 }
                 "aten._scaled_dot_product_cudnn_attention.default"|"aten.scaled_dot_product_attention.default"=>{
                     let q=get(&tensors,&args[0])?;let k=get(&tensors,&args[1])?;let v=get(&tensors,&args[2])?;
+                    let gathered=if node["sp_gather"]==true{
+                        Some(gather.ok_or("sequence-parallel attention without its other GPU")?.gather(&[k,v],device)?)
+                    }else{None};
+                    let (k,v)=match &gathered{Some(full)=>(&full[0],&full[1]),None=>(k,v)};
                     let view=|t:&Tensor|->Result<sdpa::View>{Ok(sdpa::View{dims:t.shape.iter().map(|&x|x as i64).collect::<Vec<_>>()
                         .try_into().map_err(|_|"SDPA requires rank four")?,
                         strides:t.strides.iter().map(|&x|x as i64).collect::<Vec<_>>().try_into().map_err(|_|"SDPA rank")?,offset_bytes:0})};

@@ -60,25 +60,17 @@ impl Context {
         program.arena.sync()?;
         let persistent_mark = program.arena.allocation_mark();
         let persistent_bytes = program.arena.allocation_bytes();
-        if std::env::var("H3_VAE_METADATA_CAPTURE").as_deref()==Ok("1") {
+        if std::env::var("H3_VAE_METADATA_PREPARE").as_deref()==Ok("1") {
             let started_metadata=Instant::now();
+            // The cuDNN convolution and attention plans of this maximum-tile program. Plans are
+            // built only: no kernel is launched and no tensor is read.
             let prepared=(||->Result<()>{
                 program.ensure_workspace()?;
                 program.prepare_metadata_plans()?;
                 if let Some(post)=post.as_ref(){post.prepare_metadata(&program.arena,input_pointer(&program)?)?;}
-                // All pointers belong to this unchanged maximum-tile program.
-                // Stream capture records calls without reading their contents.
-                check(unsafe{cudaStreamBeginCapture(program.arena.stream,1)})?;
-                let nodes=(||->Result<()>{
-                    if let Some(post)=post.as_ref(){post.forward(&program.arena,input_pointer(&program)?,input_pointer(&program)?)?;}
-                    program.register_metadata_nodes()
-                })();
-                let mut graph=ptr::null_mut();let closed=unsafe{cudaStreamEndCapture(program.arena.stream,&mut graph)};
-                if !graph.is_null(){check(unsafe{cudaGraphDestroy(graph)})?;}
-                unsafe{cudaGetLastError();}
-                nodes?;check(closed)
+                Ok(())
             })();
-            eprintln!("H3_VIDEO_METADATA stage={} seconds={:.6} passed={} graphs_launched=0",stage,started_metadata.elapsed().as_secs_f64(),prepared.is_ok());
+            eprintln!("H3_VIDEO_METADATA stage={} seconds={:.6} passed={}",stage,started_metadata.elapsed().as_secs_f64(),prepared.is_ok());
             if let Err(error)=prepared {eprintln!("video metadata setup deferred: {error}");}
             program.arena.release_after(persistent_mark)?;program.workspace_released();
             if program.arena.allocation_bytes()!=persistent_bytes{return Err("metadata temporary allocations did not return to baseline".into());}

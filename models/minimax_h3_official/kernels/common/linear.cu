@@ -24,11 +24,5 @@ extern "C" int h3_linear_tune_against(void* handle, const void* input, const voi
 extern "C" int h3_linear_forward_pinned(void* handle, const void* input, const void* weight, const void* bias,
     void* output, int rows, int out_features, int in_features, int dtype) {return infra_linear_forward_pinned(handle, input, weight, bias, output, rows, out_features, in_features, dtype);}
 extern "C" int h3_linear_bitwise_equal(void* handle, const void* a, const void* b, size_t bytes, int* equal) {return infra_linear_bitwise_equal(handle, a, b, bytes, equal);}
-extern "C" int h3_linear_prepare_qwen(void* handle) {
-    static const InfraLinearShape shapes[]={{2304,1152,3456,1},{2304,1152,1152,1},{2304,1152,4608,1},{2304,4608,1152,1},
-        {576,4608,4608,1},{576,4608,5120,1},{1024,5120,8192,0},{1024,5120,1024,0},{1024,8192,5120,0},
-        {1024,5120,25600,0},{1024,25600,5120,0}};
-    return infra_linear_prepare(handle,shapes,sizeof(shapes)/sizeof(shapes[0]),"H3_QWEN_BACKEND_METADATA");
-}
 extern "C" void h3_linear_fallback_reset(){infra_linear_fallback_reset();}
 extern "C" int h3_linear_fallback_counts(uint64_t* out,int size){return infra_linear_fallback_counts(out,size);}
