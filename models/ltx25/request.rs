@@ -44,7 +44,7 @@ pub struct Session {
     host_budget:native_core_infra::pinned_weights::HostBudget,
     assets:Rc<native_core_infra::immutable_assets::ImmutableAssets>,
     linear:Rc<Linear>,device:Rc<Device>,resident:bool,retain_host_cache:bool,generation:Cell<u64>,
-    linear_shapes_prepared:usize,processor_attention_prepared:Rc<RefCell<BTreeMap<PathBuf,usize>>>,
+    processor_attention_prepared:Rc<RefCell<BTreeMap<PathBuf,usize>>>,
     cpu_preparation:RefCell<Option<native_core_infra::startup_policy::CpuPreparation<crate::frontend::GemmaTokenizer>>>,
     pending:RefCell<Option<native_core_infra::model_load::Components>>,
     checkpoint_identity:Option<String>,
@@ -59,7 +59,7 @@ impl Session {
         Ok(Self {declared:None,cpu_preparation:RefCell::new(None),pending:RefCell::new(None),peer:None,checkpoint_identity:None,prepared_profile:RefCell::new(None),prepared_receipt:RefCell::new(None),framework:None,checkpoints:RefCell::new(BTreeMap::new()),
             host_budget:native_core_infra::pinned_weights::HostBudget::new(80usize<<30),
             assets:Rc::new(native_core_infra::immutable_assets::ImmutableAssets::new(2usize<<30,4096)),
-            linear,device,resident:false,retain_host_cache:true,generation:Cell::new(0),linear_shapes_prepared:0,
+            linear,device,resident:false,retain_host_cache:true,generation:Cell::new(0),
             processor_attention_prepared:Rc::new(RefCell::new(BTreeMap::new())),phase_callback:None})
     }
     pub fn open_resident()->Result<Self>{
@@ -71,7 +71,7 @@ impl Session {
     }
     /// With two GPUs, GPU 0 loads exactly as one GPU does. GPU 1 opens its
     /// context once GPU 0's is ready (opening both at once delays GPU 0's
-    /// uploads), then copies blocks 24-47 from GPU 0's DiT over the peer link.
+    /// uploads), then copies the 48 blocks from GPU 0's DiT over the peer link.
     pub(crate) fn open_resident_with_checkpoint_world(framework:impl Into<Option<native_core_infra::checkpoint::Declaration>>,
         world:usize)->Result<Self>{
         if !matches!(world,1|2){return Err("LTX supports one or two physical GPUs".into());}
@@ -97,7 +97,7 @@ impl Session {
         Ok(Self {declared:Some(RefCell::new(startup)),cpu_preparation:RefCell::new(None),pending:RefCell::new(None),peer:None,checkpoint_identity:None,prepared_profile:RefCell::new(None),prepared_receipt:RefCell::new(None),framework:Some(framework),checkpoints:RefCell::new(BTreeMap::new()),
             host_budget:native_core_infra::pinned_weights::HostBudget::new(80usize<<30),
             assets:resources.assets,linear:resources.linear,device:resources.device,resident:true,retain_host_cache:true,generation:Cell::new(0),
-            linear_shapes_prepared:resources.linear_shapes,processor_attention_prepared:attention,phase_callback:None})
+            processor_attention_prepared:attention,phase_callback:None})
     }
     fn open_parallel(framework:native_core_infra::checkpoint::Declaration,activate:bool,world_size:usize)->Result<Self>{
         if !matches!(world_size,1|2){return Err("LTX supports one or two physical GPUs".into());}
@@ -115,14 +115,8 @@ impl Session {
         let assets=Rc::new(native_core_infra::immutable_assets::ImmutableAssets::new(2usize<<30,4096));
         if resident{device.host_assets=Some(assets.clone());}
         let device=Rc::new(device);let linear=Rc::new(Linear::new(&device)?);
-        let mut linear_shapes_prepared=0;
-        if let Some(declaration)=&framework {
-            let shapes=crate::startup::linear_shapes(declaration)?;
-            native_core_infra::startup_trace::measure("startup_backend_prepare","linear metadata",0,||linear.prepare(&shapes))?;
-            linear_shapes_prepared=shapes.len();
-        }
         if activate{if let Some(pending)=&mut pending{unsafe{pending.device_ready()}?;}}
-        Ok(Self{declared:None,retain_host_cache:true,linear_shapes_prepared,processor_attention_prepared:Rc::new(RefCell::new(BTreeMap::new())),cpu_preparation:RefCell::new(cpu_preparation),pending:RefCell::new(pending),framework,checkpoint_identity:None,checkpoints:RefCell::new(BTreeMap::new()),
+        Ok(Self{declared:None,retain_host_cache:true,processor_attention_prepared:Rc::new(RefCell::new(BTreeMap::new())),cpu_preparation:RefCell::new(cpu_preparation),pending:RefCell::new(pending),framework,checkpoint_identity:None,checkpoints:RefCell::new(BTreeMap::new()),
             host_budget:native_core_infra::pinned_weights::HostBudget::new(80usize<<30),linear,device,resident,
             assets,peer:None,
             generation:Cell::new(0),prepared_profile:RefCell::new(None),prepared_receipt:RefCell::new(None),phase_callback:None})
@@ -137,12 +131,11 @@ impl Session {
         self.declared.as_ref().map(|runtime|runtime.borrow_mut().enter(name)).transpose().map_err(Into::into)
     }
     fn preparation_report(&self)->Value{
-        json!({"required":["text linear metadata","processor attention layouts","Gemma tokenizer"],
-            "text_linear_shapes":self.linear_shapes_prepared,
+        json!({"required":["processor attention layouts","Gemma tokenizer"],
             "processor_attention_plans":*self.processor_attention_prepared.borrow(),
             "tokenizer_complete":self.framework.is_none()
                 || self.checkpoints.borrow().values().any(|(_,checkpoint)|checkpoint.tokenizer_loaded()),
-            "remaining_first_use":["Triton module loading","native convolution plans and workspaces","request activation and sampler allocations"],
+            "remaining_first_use":["text cuBLASLt algorithm selection and kernel loading","Triton module loading","native convolution plans and workspaces","request activation and sampler allocations"],
             "full_execution_prepared":false})
     }
     fn finish_cpu_preparation(&self,text:&Checkpoint)->Result<()>{
@@ -243,7 +236,6 @@ impl Session {
             let checkpoint=self.checkpoint(&gold,&config.weights,kind,file)?;
             let mut missing=Vec::new();
             for (key,info) in checkpoint.header.as_object().ok_or("checkpoint header")?{
-                if self.peer.is_some() && kind=="transformer" && crate::parallel::second_partition(key){continue;}
                 if !matches!(info["dtype"].as_str(),Some("BF16"|"F32")){continue;}
                 let offsets=info["data_offsets"].as_array().ok_or("weight offsets")?;
                 if offsets.len()!=2{return Err("weight offset pair".into());}
@@ -366,7 +358,6 @@ impl Session {
             let mut uploaded_count=0usize;let mut uploaded_bytes=0usize;
             let uploaded_keys=missing.map(|groups|groups[index].iter().cloned().collect::<std::collections::HashSet<_>>());
             for(key,info)in checkpoint.header.as_object().ok_or("checkpoint header")?{
-                if self.peer.is_some() && name=="dit" && crate::parallel::second_partition(key){continue;}
                 if !matches!(info["dtype"].as_str(),Some("BF16"|"F32")){continue;}
                 let offsets=info["data_offsets"].as_array().ok_or("weight offsets")?;
                 let size=offsets[1].as_u64().and_then(|n|n.checked_sub(offsets[0].as_u64()?)).ok_or("weight extent")? as usize;
@@ -414,7 +405,7 @@ impl Session {
         let mut values=vec![json!({"device_index":0,"device_uuid":self.device.uuid()?,
             "cached_weight_tensors":self.device.cached_weight_tensors(),
             "owner_pid":std::process::id(),"owner_instance":native_core_infra::process_identity::current(),
-            "first_block":0,"end_block":if self.peer.is_some(){24}else{48}})];
+            "first_block":0,"end_block":48})];
         if let Some(peer)=&self.peer{values.push(peer.status()?);}Ok(values)
     }
     fn pin_retained_sources(&self)->Result<()> {
@@ -443,7 +434,9 @@ impl Session {
             "resident_kernel_modules":self.device.kernel_count()}))
     }
     pub fn warm_host(&self,profile:&Path)->Result<Value>{
-        self.declared.as_ref().ok_or("host warmup requires a resident declaration")?.borrow().check_host_warm()?;
+        // A declared session checks its startup loads. The two-GPU backend session has none: below, GPU 0
+        // prepares its own host copies and GPU 1 its blocks.
+        if let Some(declared)=&self.declared{declared.borrow().check_host_warm()?;}
         let config:Config=serde_json::from_slice(&std::fs::read(profile)?)?;
         if !config.inference || !self.resident{return Err("host warmup requires a resident inference profile".into());}
         let gold=Gold::profile(&config.gold,config.profile_manifests.get("gold").ok_or("profile identity")?)?;
@@ -602,7 +595,7 @@ fn noised(gold:&Gold,stage:usize,modality:usize,source:&Tensor,encoded:Option<&T
 pub fn infer(profile:&Path,request:&Path,output:&Path)->Result<Value>{
     infer_on(1,profile,request,output)
 }
-/// `infer` on `world` GPUs (1, or 2 to run blocks 24-47 on GPU 1).
+/// `infer` on `world` GPUs (1, or 2 to run the blocks sequence parallel).
 pub fn infer_on(world:usize,profile:&Path,request:&Path,output:&Path)->Result<Value>{
     let framework=crate::admission::checkpoint(None)?;
     // This owner exits immediately after its one complete request. Keep the
@@ -751,6 +744,8 @@ fn run_warmed(&self,mut config:Config,gate:Option<native_core_infra::phase_gate:
     let _vae_use=self.use_component("vae")?;
     let _upscale_use=self.use_component("upscale")?;
     self.phase("sampling");
+    // LTX25_HOST_PROFILE=1: the host time of sampling alone (the request's total is reported too).
+    if crate::graph::host_profiling(){let _=crate::graph::host_profile_take();}
     let mut checks=report["checks"].as_array().ok_or("text checks")?.clone();
     let contexts=[contexts[0].clone(),contexts[1].clone()];
     let mut host_preparation=None;
@@ -816,6 +811,7 @@ fn run_warmed(&self,mut config:Config,gate:Option<native_core_infra::phase_gate:
     }
     // Sampling has drained before registering retained sources or retiring weights.
     self.pin_retained_sources()?;
+    let sampling_host=crate::graph::host_profiling().then(crate::graph::host_profile_take);
     self.phase("decode_boundary");
     let decode_handoff=if let Some(gate)=gate{
         Some(native_core_infra::phase_gate::acknowledge_with_retirement(&gate,"decode",&[height,width,frames],||{
@@ -883,20 +879,16 @@ fn run_warmed(&self,mut config:Config,gate:Option<native_core_infra::phase_gate:
     let expected_forwards:usize=sampling_steps.iter().sum();
     let parallel=if let Some(peer)=&self.peer{
         let forwards=peer.completed_forwards()-peer_start;
-        if forwards==0 && crate::forward::graphs_enabled(){
-            // Sampling replayed CUDA graphs of all 48 blocks on GPU 0 (see sampling::run_parallel).
-            json!({"world_size":2,"mode":"gpu0-cuda-graphs","gpu1_dit_replica":replica,"devices":self.devices()?,
-                "forwards_per_rank":[expected_forwards,0],"block_evaluations_per_rank":[expected_forwards*48,0]})
-        }else{
-        if forwards!=expected_forwards{return Err("both LTX partitions must complete every configured DiT forward".into());}
-        json!({"world_size":2,"mode":"pipeline-model-parallel","boundary_transfer":"peer copy of each tensor's allocation",
+        if forwards!=expected_forwards{return Err("both LTX GPUs must complete every configured DiT forward".into());}
+        json!({"world_size":2,"mode":"sequence-parallel",
+            "token_split":"video tokens halved per GPU (GPU 0 takes the odd one); audio and text context whole on both",
+            "exchange":"peer copies of attention keys/values before video self-attention and audio-to-video attention",
             "gpu1_dit_replica":replica,"devices":self.devices()?,"all_ranks_completed":true,"forwards_per_rank":forwards,
-            "blocks_per_rank":[24,24],"block_evaluations_per_rank":[forwards*24,forwards*24]})
-        }
+            "blocks_per_rank":[48,48],"block_evaluations_per_rank":[forwards*48,forwards*48]})
     }else{json!({"world_size":1,"devices":self.devices()?,"forwards_per_rank":expected_forwards,
         "all_ranks_completed":true,"block_evaluations_per_rank":[expected_forwards*48]})};
     Ok(json!({"passed":true,"rung":if config.inference{"native-inference"}else{"request-latents"},"checks":checks,"outputs":outputs,"decoded":decoded,
-        "parallel":parallel,"sampling_steps_per_stage":sampling_steps,"decode_handoff":decode_handoff,
+        "parallel":parallel,"sampling_steps_per_stage":sampling_steps,"decode_handoff":decode_handoff,"sampling_host_profile":sampling_host,
         "first_dit_start":first_dit.report()?,
         "declared_startup":self.declared.as_ref().map(|runtime|runtime.borrow().report()),
         "host_retained_bytes":self.retained_bytes(),"host_pinned_bytes":self.pinned_host_bytes()?,

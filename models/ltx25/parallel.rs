@@ -1,19 +1,21 @@
-//! Two physical GPUs split the DiT's 48 blocks 24/24 on every forward.
-//! Each thread owns its CUDA context, allocator, handles and kernel cache.
-//! Boundary tensors cross as exact peer copies that preserve logical values
-//! and strides; model arithmetic is exactly the original block graph, with no
-//! cross-device reductions. At cold start GPU 1 copies its blocks from GPU 0's
-//! DiT over the peer link instead of reading them again.
+//! Two physical GPUs run the DiT's 48 blocks sequence parallel on every forward (see `sp`): each
+//! takes half of the video tokens through all blocks. Each thread owns its CUDA context, allocator,
+//! handles and kernel cache. Tensors cross as exact peer copies that preserve logical values and
+//! strides; model arithmetic is exactly the original block graph, with no cross-device reductions.
+//! At cold start GPU 1 copies the blocks from GPU 0's DiT over the peer link instead of reading
+//! them again.
 use crate::{backbone,cuda::{Buffer,Device},gold::{self,Gold},linear::Linear,
     request::Config,tensor::{self,Tensor},weights::Checkpoint,Result};
 use native_core_infra::device_context::copy_peer;
 use serde_json::{json,Value};
 use std::{cell::{Cell,RefCell},collections::BTreeMap,path::{Path,PathBuf},rc::Rc,sync::mpsc,thread,time::Instant};
 
-pub fn second_partition(key:&str)->bool{
+/// The DiT tensors GPU 1 holds: every transformer block (the input projections and output heads
+/// run on GPU 0 only).
+pub fn peer_partition(key:&str)->bool{
     key.strip_prefix("model.diffusion_model.transformer_blocks.")
         .and_then(|suffix|suffix.split('.').next()).and_then(|block|block.parse::<usize>().ok())
-        .is_some_and(|block|(24..48).contains(&block))
+        .is_some_and(|block|block<48)
 }
 
 /// A tensor on the other GPU, named by address for a peer copy.
@@ -34,7 +36,8 @@ impl PeerTensor {
     }
     /// A copy into a new allocation on `device`, from the private context `source`.
     fn copy(&self,source:usize,device:&Device)->Result<Tensor>{
-        let storage=Buffer::new(self.bytes)?;
+        // A stream-ordered transient: reused only by work queued after this copy on `device`.
+        let storage=device.transient(self.bytes)?;
         unsafe{copy_peer(storage.dev(),device.context_identity()?,self.address,source,self.bytes,device.stream)}?;
         Ok(Tensor{storage:Rc::new(storage),shape:self.shape.clone(),strides:self.strides.clone(),
             dtype:self.dtype.clone(),offset:self.offset,reference_offset:self.reference_offset})
@@ -44,7 +47,8 @@ type Reply<T>=mpsc::Sender<std::result::Result<T,String>>;
 enum Work {
     Warm(PathBuf,Option<gold::Shared>,Reply<Value>),Prefetch(PathBuf,usize,bool,Reply<Value>),Identity(String,Reply<Value>),
     Replicate(usize,Vec<(String,PeerTensor)>,Reply<Value>),
-    Forward(usize,usize,Value,usize,BTreeMap<String,PeerTensor>,Reply<(BTreeMap<String,PeerTensor>,Value)>),
+    /// Stage, step, request, GPU 0's context, an event after GPU 0 wrote the inputs, the inputs.
+    Forward(usize,usize,Value,usize,usize,BTreeMap<String,PeerTensor>,crate::sp::Exchange,Reply<(BTreeMap<String,PeerTensor>,Value)>),
     Evict(Reply<Value>),Status(Reply<Value>),Stop,
 }
 struct Half {
@@ -79,7 +83,7 @@ impl Half {
         "host_pinned_bytes":self.budget.used()+self.checkpoints.values().flat_map(|c|c.retained_hosts())
             .map(|host|host.pinned_bytes()).sum::<usize>(),
         "startup_loader":if self.framework.is_some(){"core_infra::model_load"}else{"full-file pinned fallback"},
-        "first_block":24,"end_block":48,
+        "first_block":0,"end_block":48,
         "completed_block_evaluations":self.blocks,"resident_kernel_modules":self.device.kernel_count()}))}
     /// `shared`: GPU 0's parsed gold profile, which this GPU then need not parse again.
     fn warm(&mut self,path:&Path,shared:Option<gold::Shared>)->Result<Value>{
@@ -100,7 +104,7 @@ impl Half {
                     // Without a host copy, the blocks come from GPU 0 or the admitted files.
                     if self.retain_host{
                         let requests=declaration.manifest.tensors.iter().filter(|(name,entry)|
-                            name.strip_prefix("dit.").is_some_and(second_partition) &&
+                            name.strip_prefix("dit.").is_some_and(peer_partition) &&
                             matches!(entry.dtype,native_core_infra::checkpoint::Dtype::BF16|native_core_infra::checkpoint::Dtype::F32))
                             .map(|(name,entry)|native_core_infra::model_load::Request{name:name.clone(),dtype:entry.dtype}).collect();
                         let mut options=native_core_infra::model_load::Options::for_declaration(declaration)?;
@@ -126,7 +130,7 @@ impl Half {
         let config:Config=serde_json::from_slice(&std::fs::read(path)?)?;
         let(mut count,mut bytes,mut resident_count,mut resident_bytes,mut copied_count,mut copied_bytes)=(0,0,0,0,0,0);
         for(key,info)in checkpoint.header.as_object().ok_or("checkpoint header")?{
-            if !second_partition(key)||!matches!(info["dtype"].as_str(),Some("BF16"|"F32")){continue;}
+            if !peer_partition(key)||!matches!(info["dtype"].as_str(),Some("BF16"|"F32")){continue;}
             let offsets=info["data_offsets"].as_array().ok_or("weight offsets")?;
             let size=offsets[1].as_u64().and_then(|n|n.checked_sub(offsets[0].as_u64()?)).ok_or("weight extent")? as usize;
             count+=1;bytes+=size;
@@ -154,7 +158,7 @@ impl Half {
         self.warm(path,None)?;
         let checkpoint=&self.profiles[path].2;
         let keys=checkpoint.header.as_object().ok_or("checkpoint header")?.iter()
-            .filter(|(key,info)|second_partition(key) && matches!(info["dtype"].as_str(),Some("BF16"|"F32")))
+            .filter(|(key,info)|peer_partition(key) && matches!(info["dtype"].as_str(),Some("BF16"|"F32")))
             .filter(|(key,_)|copy&&self.device.cached_weight(&format!("{}\0{key}",checkpoint.path.display())).is_none())
             .map(|(key,_)|key.clone()).collect::<Vec<_>>();
         let bytes=keys.iter().try_fold(0usize,|sum,key|->Result<usize>{
@@ -172,14 +176,14 @@ impl Half {
         status["gpu_prepare_complete"]=json!(copy);status["copy_complete"]=json!(true);
         Ok(status)
     }
-    /// Copies GPU 0's resident blocks 24-47 into one allocation of this device's cache.
+    /// Copies GPU 0's resident blocks into one allocation of this device's cache.
     fn replicate(&mut self,source:usize,tensors:Vec<(String,PeerTensor)>)->Result<Value>{
         self.link(source)?;
         let path=self.current.as_ref().ok_or("dual LTX profile not warmed")?;
         let checkpoint=self.profiles.get(path).ok_or("dual profile missing")?.2.clone();
         let started=Instant::now();let aligned=|bytes:usize|bytes.div_ceil(256)*256;
         let total=tensors.iter().map(|(_,value)|aligned(value.bytes)).sum::<usize>();
-        let _span=native_core_infra::startup_trace::Span::new("model_replicate","LTX DiT blocks 24-47",total);
+        let _span=native_core_infra::startup_trace::Span::new("model_replicate","LTX DiT blocks 0-47",total);
         let storage=Rc::new(Buffer::new(total)?);let target=self.device.context_identity()?;let mut offset=0;
         for (key,value) in &tensors{
             unsafe{copy_peer(storage.at(offset),target,value.address,source,value.bytes,self.device.stream)}?;
@@ -191,24 +195,27 @@ impl Half {
         Ok(json!({"device_uuid":self.device.uuid()?,"tensors":tensors.len(),"bytes":total,
             "seconds":started.elapsed().as_secs_f64()}))
     }
-    fn forward(&mut self,stage:usize,step:usize,request:Value,source:usize,inputs:BTreeMap<String,PeerTensor>)
-        ->Result<(BTreeMap<String,PeerTensor>,Value)>{
+    /// GPU 1's token range of a sequence-parallel forward: all 48 blocks of the local program.
+    #[allow(clippy::too_many_arguments)]
+    fn forward(&mut self,stage:usize,step:usize,request:Value,source:usize,written:usize,inputs:BTreeMap<String,PeerTensor>,
+        exchange:crate::sp::Exchange)->Result<(BTreeMap<String,PeerTensor>,Value)>{
         self.link(source)?;
         let path=self.current.as_ref().ok_or("dual LTX profile not warmed")?;
         let (gold,templates,checkpoint)=self.profiles.get_mut(path).ok_or("dual profile missing")?;
         gold.identity["request"]=request;
+        let local=crate::sp::local(&gold.root,stage,&templates[stage],crate::sp::split(exchange.total(),exchange.rank()).1)?;
+        // Copy the inputs once GPU 0 has written them; GPU 0 keeps them until this reply arrives.
+        crate::cuda::wait_event(self.device.stream,written)?;
         let inputs=inputs.into_iter().map(|(key,value)|Ok((key,value.copy(source,&self.device)?)))
             .collect::<Result<BTreeMap<_,_>>>()?;
-        // GPU 0 may reuse its inputs once this reply arrives.
-        self.device.sync()?;
-        let (values,report)=backbone::execute_range(gold,&templates[stage],checkpoint,stage,step,inputs,
-            &self.device,&self.linear,24..48)?;
-        if report["passed"]!=true{return Err("secondary LTX block partition failed".into());}
+        let (values,report)=backbone::execute_range_with(gold,&local.graph,checkpoint,stage,step,inputs,
+            &self.device,&self.linear,0..48,Some(&exchange))?;
+        if report["passed"]!=true{return Err("secondary LTX token range failed".into());}
         let result=values.into_iter().filter(|(key,_)|key.ends_with(".video.x") || key.ends_with(".audio.x"))
             .collect::<BTreeMap<_,_>>();
         if result.len()!=2{return Err("secondary LTX output boundary incomplete".into());}
         let outputs=result.iter().map(|(key,value)|(key.clone(),PeerTensor::whole(value))).collect();
-        self.returned=Some(result);self.blocks+=24;Ok((outputs,report))
+        self.returned=Some(result);self.blocks+=48;Ok((outputs,report))
     }
 }
 
@@ -228,7 +235,7 @@ impl Pending {
 impl Drop for Pending {
     fn drop(&mut self){if let Some(reply)=self.reply.take(){let _=reply.recv();}}
 }
-/// GPU 1's copy of GPU 0's blocks 24-47 in flight. Dropping it waits for the
+/// GPU 1's copy of GPU 0's blocks in flight. Dropping it waits for the
 /// copy, which reads `_sources`.
 pub(crate) struct Replica {pending:Pending,_sources:Vec<Tensor>}
 impl Replica {pub(crate) fn finish(self)->Result<Value>{self.pending.finish()}}
@@ -256,7 +263,8 @@ impl ParallelBlocks {
                 Work::Prefetch(path,budget,copy,sender)=>reply!(sender,half.prefetch(&path,budget,copy)),
                 Work::Identity(identity,sender)=>{half.identity=Some(identity);reply!(sender,half.status());},
                 Work::Replicate(source,tensors,sender)=>reply!(sender,half.replicate(source,tensors)),
-                Work::Forward(stage,step,request,source,inputs,sender)=>reply!(sender,half.forward(stage,step,request,source,inputs)),
+                Work::Forward(stage,step,request,source,written,inputs,exchange,sender)=>
+                    reply!(sender,half.forward(stage,step,request,source,written,inputs,exchange)),
                 Work::Evict(sender)=>reply!(sender,half.device.clear_weight_cache().and_then(|_|half.status())),
                 Work::Status(sender)=>reply!(sender,half.status()),Work::Stop=>break,
             }}
@@ -286,12 +294,12 @@ impl ParallelBlocks {
     pub(crate) fn begin_warm(&self,path:&Path,gold:&Gold)->Result<Pending>{
         Ok(Pending{reply:Some(self.send(|reply|Work::Warm(path.into(),Some(gold.share()),reply))?)})
     }
-    /// Starts GPU 1's copy of blocks 24-47 from GPU 0's resident `checkpoint` tensors.
+    /// Starts GPU 1's copy of the blocks from GPU 0's resident `checkpoint` tensors.
     pub(crate) fn begin_replicate(&self,checkpoint:&Checkpoint,device:&Device)->Result<Replica>{
         self.link(device)?;device.sync()?;
         let mut tensors=Vec::new();let mut sources=Vec::new();
         for (key,info) in checkpoint.header.as_object().ok_or("checkpoint header")?{
-            if !second_partition(key) || !matches!(info["dtype"].as_str(),Some("BF16"|"F32")){continue;}
+            if !peer_partition(key) || !matches!(info["dtype"].as_str(),Some("BF16"|"F32")){continue;}
             let value=device.cached_weight(&format!("{}\0{key}",checkpoint.path.display())).ok_or("GPU 0 DiT is not resident")?;
             tensors.push((key.clone(),PeerTensor::weight(&value)?));sources.push(value);
         }
@@ -309,18 +317,63 @@ impl ParallelBlocks {
     pub fn evict(&self)->Result<Value>{self.request(Work::Evict)}
     pub fn status(&self)->Result<Value>{self.request(Work::Status)}
     pub fn completed_forwards(&self)->usize{self.forwards.get()}
-    pub fn forward(&self,gold:&Gold,stage:usize,step:usize,mut inputs:BTreeMap<String,Tensor>,device:&Device)
-        ->Result<(BTreeMap<String,Tensor>,Value)>{
+    /// The 48 blocks of one forward, sequence parallel: GPU 0 runs its token range of `inputs` here
+    /// while GPU 1 runs the other, and the block outputs are assembled on GPU 0. `template` is the
+    /// stage's block program at all tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(&self,gold:&Gold,template:&Value,checkpoint:&Checkpoint,stage:usize,step:usize,
+        mut inputs:BTreeMap<String,Tensor>,device:&Device,linear:&Linear)->Result<(BTreeMap<String,Tensor>,Value)>{
+        if gold.verify{return Err("sequence-parallel forwards are not reference-verified per tensor".into());}
         let context=self.link(device)?;
-        // GPU 1 reads these inputs once GPU 0 has written them.
-        device.sync()?;
-        let peer=inputs.iter().map(|(key,value)|(key.clone(),PeerTensor::whole(value))).collect();
-        let request=gold.identity["request"].clone();let source=device.context_identity()?;
-        let (outputs,report)=self.request(|reply|Work::Forward(stage,step,request,source,peer,reply))?;
-        for (key,value) in outputs{inputs.insert(key,value.copy(context,device)?);}
-        // GPU 1 frees its outputs with the next command.
-        device.sync()?;
-        self.forwards.set(self.forwards.get()+1);Ok((inputs,report))
+        let prefix=format!("block.{stage}.0.0");
+        let (video,audio)=(format!("{prefix}.kwargs.video.x"),format!("{prefix}.kwargs.audio.x"));
+        let total=inputs.get(&video).ok_or("block inputs have no video tokens")?.shape[1];
+        let ranges=[crate::sp::split(total,0),crate::sp::split(total,1)];
+        let locals=[crate::sp::local(&gold.root,stage,template,ranges[0].1)?,crate::sp::local(&gold.root,stage,template,ranges[1].1)?];
+        let mut own=BTreeMap::new();let mut theirs=BTreeMap::new();let mut held=Vec::new();
+        for (key,value) in &inputs{
+            match locals[0].axes.get(key){
+                Some(&axis)=>{
+                    own.insert(key.clone(),crate::sp::narrow(value,axis,ranges[0],&locals[0].graph["externals"][key],device)?);
+                    let other=crate::sp::narrow(value,axis,ranges[1],&locals[1].graph["externals"][key],device)?;
+                    theirs.insert(key.clone(),PeerTensor::whole(&other));held.push(other);
+                }
+                None=>{own.insert(key.clone(),value.clone());theirs.insert(key.clone(),PeerTensor::whole(value));}
+            }
+        }
+        // GPU 1 reads its inputs once GPU 0 has written them.
+        let written=crate::cuda::Event::record(device.stream)?;
+        let source=device.context_identity()?;
+        let (exchange,peer_exchange)=crate::sp::Exchange::pair(total,[source,context]);
+        let request=gold.identity["request"].clone();
+        let reply=self.send(|reply|Work::Forward(stage,step,request,source,written.handle(),theirs,peer_exchange,reply))?;
+        let own_result=backbone::execute_range_with(gold,&locals[0].graph,checkpoint,stage,step,own,device,linear,0..48,Some(&exchange));
+        // If this half failed, drop its end first: GPU 1's next exchange then fails instead of waiting.
+        let exchange=if own_result.is_ok(){Some(exchange)}else{drop(exchange);None};
+        // Drain GPU 1's reply even if this half failed.
+        let peer_result:Result<(BTreeMap<String,PeerTensor>,Value)>=match reply.recv(){
+            Ok(value)=>value.map_err(Into::into),Err(_)=>{self.booted()?;Err("LTX GPU 1 stopped".into())}};
+        let (values,report)=own_result?;let (outputs,peer_report)=peer_result?;
+        if report["passed"]!=true{return Err("primary LTX token range failed".into());}
+        // Video tokens in order: GPU 0's range, then GPU 1's. Audio is identical on both GPUs.
+        let own_video=values.get(&video).ok_or("missing primary video output")?;
+        let peer_video=outputs.get(&video).ok_or("missing secondary video output")?.copy(context,device)?;
+        let mut shape=own_video.shape.clone();shape[1]=total;
+        let full=Tensor::contiguous_shape(shape,own_video.dtype.clone(),device)?;
+        for (part,(start,count)) in [(own_video,ranges[0]),(&peer_video,ranges[1])]{
+            if part.shape[1]!=count{return Err("token range output extent differs".into());}
+            let mut rows=full.clone();rows.shape[1]=count;rows.offset+=start*full.strides[1]*tensor::dtype(&full.dtype)?.1;
+            tensor::copy(part,&rows,device.stream)?;
+        }
+        inputs.insert(video,full);
+        inputs.insert(audio.clone(),values.get(&audio).ok_or("missing primary audio output")?.clone());
+        // GPU 1 frees its outputs with the next command; its input copies were done before it replied.
+        device.sync()?;drop(held);drop(exchange);drop(written);
+        self.forwards.set(self.forwards.get()+1);
+        let mut checks=report["checks"].as_array().cloned().unwrap_or_default();
+        checks.extend(peer_report["checks"].as_array().cloned().unwrap_or_default());
+        Ok((inputs,serde_json::json!({"passed":true,"rung":"backbone","checks":checks,"sequence_parallel":{
+            "tokens":total,"ranges":ranges,"device_uuid":report["device_uuid"],"peer_device_uuid":peer_report["device_uuid"]}})))
     }
 }
 

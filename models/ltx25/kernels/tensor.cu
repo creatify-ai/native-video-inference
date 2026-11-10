@@ -870,14 +870,29 @@ std::string cached_fused(const std::string& src) {
 // The compiled kernel for a program (nullptr when NVRTC or the module load fails: the interpreted
 // kernel runs instead).
 void* fused_kernel(const FuseProgram& p, int e) {
-    const std::string src = fused_source(p, e);
-    if (src.empty()) return nullptr;
     void* context = nullptr;
     if (cuCtxGetCurrent(&context) != 0 || !context) return nullptr;
+    // Everything fused_source reads, as a compact key: the source (and so the kernel) is a function
+    // of it. Generating the source text for every launch cost about as much host time as the launch.
+    std::string shape;
+    shape.reserve(64 + 24 * p.nops);
+    auto put = [&](int v) { shape.append(reinterpret_cast<const char*>(&v), sizeof v); };
+    put(e); put(p.nin); put(p.nout); put(p.nops); put(e == 4 ? int(p.unit) : 0);
+    for (int k = 0; k < p.nin + p.nout; ++k) put(p.dtype[k]);
+    for (int q = 0; q < p.nops; ++q) {
+        const FuseOp& o = p.ops[q];
+        put(o.op); put(o.a); put(o.b); put(o.c); put(o.round); put(o.scalar_b);
+    }
+    for (int k = 0; k < p.nout; ++k) put(p.out_reg[k]);
+    static auto* by_shape = new std::map<std::pair<void*, std::string>, void*>();
     std::lock_guard<std::mutex> lock(fused_mutex());
+    const auto shape_key = std::make_pair(context, shape);
+    if (auto it = by_shape->find(shape_key); it != by_shape->end()) return it->second;
+    const std::string src = fused_source(p, e);
+    if (src.empty()) { (*by_shape)[shape_key] = nullptr; return nullptr; }
     auto& cache = fused_kernels();
     const auto key = std::make_pair(context, src);
-    if (auto it = cache.find(key); it != cache.end()) return it->second;
+    if (auto it = cache.find(key); it != cache.end()) { (*by_shape)[shape_key] = it->second; return it->second; }
     void* function = nullptr;
     static auto* cubins = new std::map<std::string, std::string>();  // compiled once per process for every context
     auto found = cubins->find(src);
@@ -887,6 +902,7 @@ void* fused_kernel(const FuseProgram& p, int e) {
     if (!cubin.empty() && cuModuleLoadData(&module, cubin.data()) == 0)
         if (cuModuleGetFunction(&function, module, "fused") != 0) function = nullptr;
     cache[key] = function;
+    (*by_shape)[shape_key] = function;
     return function;
 }
 }  // namespace

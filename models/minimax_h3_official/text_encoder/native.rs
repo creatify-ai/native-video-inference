@@ -21,7 +21,6 @@ unsafe extern "C" {
     fn h3_linear_forward(handle: *mut c_void, x: *const c_void, w: *const c_void, bias: *const c_void,
         out: *mut c_void, rows: c_int, n: c_int, k: c_int, dtype: c_int) -> c_int;
     fn h3_linear_destroy(handle: *mut c_void);
-    fn h3_linear_prepare_qwen(handle:*mut c_void)->c_int;
     fn h3_linear_error() -> *const c_char;
     fn q3_rms(x: *const c_void, w: *const c_void, out: *mut c_void, rows: i64, cols: c_int, eps: f32, stream: Stream) -> c_int;
     fn q3_layernorm(x: *const c_void, w: *const c_void, bias: *const c_void, out: *mut c_void, rows: i64, cols: c_int, eps: f32, stream: Stream) -> c_int;
@@ -53,10 +52,6 @@ impl Arena {
         let (blas,lt)=crate::startup_trace::measure("qwen_cuda_stage","workspaces",33<<20,||->Result<_> {Ok((arena.alloc(32<<20)?,arena.alloc(1<<20)?))})?;
         let _backend=crate::startup_trace::Span::new("qwen_backend_init","owner",0);
         crate::startup_trace::measure("qwen_cuda_stage","linear-create",0,||native_error(unsafe{h3_linear_create(stream,blas.ptr,blas.bytes,lt.ptr,lt.bytes,0,1,&mut arena.linear)},h3_linear_error))?;
-        if crate::weight_loader::flag("H3_QWEN_BACKEND_PREPARE")? {
-            let code=crate::startup_trace::measure("qwen_cuda_stage","backend-metadata",0,||unsafe{h3_linear_prepare_qwen(arena.linear)});
-            if code!=0{eprintln!("Qwen backend preparation deferred: {code}");}
-        }
         Ok(arena)
     }
     fn alloc(&mut self, bytes: usize) -> Result<Buffer> {

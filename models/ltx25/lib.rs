@@ -24,6 +24,8 @@ pub mod backbone;
 #[cfg(feature = "cuda")]
 pub mod parallel;
 #[cfg(feature = "cuda")]
+mod sp;
+#[cfg(feature = "cuda")]
 pub mod forward;
 #[cfg(feature = "cuda")]
 pub mod sampling;

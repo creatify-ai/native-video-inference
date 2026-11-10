@@ -13,9 +13,6 @@ int infra_linear_create(void* stream, void* blas_workspace, size_t blas_workspac
 void infra_linear_destroy(void* handle);
 int infra_linear_cublas_version(void* handle, int* version);
 const char* infra_linear_error(void);
-// Caller supplies dimensions for metadata registration. No graph is launched.
-typedef struct InfraLinearShape {int rows,in_features,out_features,bias;} InfraLinearShape;
-int infra_linear_prepare(void* handle, const InfraLinearShape* shapes, size_t count, const char* label);
 
 // Contiguous row-major tensors: input[M,K], weight[N,K], bias[N], output[M,N].
 // dtype=0: BF16; dtype=1: FP32; dtype=2: FP16 (same contract as BF16). bias=null selects the matching no-bias backend.

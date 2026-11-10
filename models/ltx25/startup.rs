@@ -26,17 +26,6 @@ fn tokenizer_parts(manifest:std::sync::Arc<native_core_infra::checkpoint::Manife
     crate::frontend::GemmaTokenizer::from_checkpoint(&checkpoint)
 }
 
-pub(crate) fn linear_shapes(declaration:&Declaration)->Result<Vec<native_core_infra::linear_prepare::Shape>>{
-    let mut shapes=std::collections::BTreeSet::new();
-    for (name,t) in &declaration.manifest.tensors {
-        if name.starts_with("text.model.layers.") && t.dtype==Dtype::BF16 && t.shape.len()==2 && name.ends_with("_proj.weight"){
-            shapes.insert(native_core_infra::linear_prepare::Shape{rows:crate::frontend::MAX_TOKENS.try_into()?,
-                in_features:t.shape[1].try_into()?,out_features:t.shape[0].try_into()?,bias:0});
-        }
-    }
-    Ok(shapes.into_iter().collect())
-}
-
 pub(crate) fn stages(declaration:&Declaration)->Result<Vec<Vec<Request>>> {
     let mut stages:Vec<Vec<Request>>=(0..5).map(|_|Vec::new()).collect();
     for (name,t) in &declaration.manifest.tensors {
@@ -52,11 +41,10 @@ pub(crate) fn stages(declaration:&Declaration)->Result<Vec<Vec<Request>>> {
     }
     Ok(stages)
 }
+/// GPU 0 loads the whole model with one GPU or two (sequence parallel: every block runs on both).
 fn stages_world(declaration:&Declaration,world:usize)->Result<Vec<Vec<Request>>>{
-    let mut values=stages(declaration)?;
-    if world==2{for stage in &mut values{stage.retain(|request|
-        !request.name.strip_prefix("dit.").is_some_and(crate::parallel::second_partition));}}
-    Ok(values)
+    if !matches!(world,1|2){return Err("LTX supports one or two physical GPUs".into());}
+    stages(declaration)
 }
 pub(crate) fn start_world(declaration:&Declaration,world:usize)->Result<Components> {
     Ok(model_load::start_components(&declaration.manifest,&declaration.roots,stages_world(declaration,world)?,Options::for_declaration(declaration)?)?)

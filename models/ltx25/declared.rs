@@ -10,7 +10,7 @@ use std::{cell::RefCell,collections::{BTreeMap,BTreeSet},path::PathBuf,rc::Rc,sy
 const STAGES:[&str;5]=["text","connectors","dit","vae","upscale"];
 #[derive(Clone)]
 pub(crate) struct Resources {
-    pub device:Rc<Device>,pub linear:Rc<Linear>,pub assets:Rc<ImmutableAssets>,pub linear_shapes:usize,
+    pub device:Rc<Device>,pub linear:Rc<Linear>,pub assets:Rc<ImmutableAssets>,
 }
 struct Target {key:String,text_root:PathBuf,checkpoints:Vec<(&'static str,Rc<Checkpoint>)>}
 pub(crate) struct LtxStartup {
@@ -51,15 +51,12 @@ impl LtxStartup {
         let plan=NativeLoadPlan::new(checkpoint.manifest.clone(),checkpoint.roots.clone(),options,mode,stages)?;
         let mut shared=Bindings::default();let mut local=OwnerBindings::default();
         let resources=Rc::new(RefCell::new(None));let owner=resources.clone();
-        let device_checkpoint=checkpoint.clone();
         let loads=unsafe {plan.bind(&mut shared,&mut local,move || {
             let assets=Rc::new(ImmutableAssets::new(2usize<<30,4096));
             let mut device=Device::open_private(0).map_err(|e|e.to_string())?;device.host_assets=Some(assets.clone());
             let linear=Linear::new(&device).map_err(|e|e.to_string())?;
-            let shapes=startup::linear_shapes(&device_checkpoint).map_err(|e|e.to_string())?;
-            native_core_infra::startup_trace::measure("startup_backend_prepare","linear metadata",0,||linear.prepare(&shapes)).map_err(|e|e.to_string())?;
             let stream=device.stream as usize;
-            *owner.borrow_mut()=Some(Resources {device:Rc::new(device),linear:Rc::new(linear),assets,linear_shapes:shapes.len()});
+            *owner.borrow_mut()=Some(Resources {device:Rc::new(device),linear:Rc::new(linear),assets});
             Ok(stream)
         })}?;
         let tokenizer=Arc::new(Mutex::new(None::<CpuPrepared<GemmaTokenizer>>));
