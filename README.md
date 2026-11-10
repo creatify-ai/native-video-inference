@@ -47,20 +47,21 @@ it. Run the same command again to skip all of that.
 Cold start of each example's default request, measured with `--cold-start` (below) on fresh
 single-use B200 containers in Modal `us-west` (16 CPU, 192 GiB; B200:2 with `--gpus 2`, and 256 GiB
 for H3), from the first line of user code to the first DiT step, at most ten containers at a time,
-on a warm Volume; two rounds of 30 per model:
+on 2026-11-09 and 2026-11-10. H3's rows pool rounds 2 and 3 of 30; Wan's and LTX's rows are one
+round of 30 each, so their P90s include hosts that had not yet cached the Volume:
 
 | Model | Default request | Weights read before the first DiT step | P50 | P90 |
 | --- | --- | --- | ---: | ---: |
-| MiniMax H3 FL2VA | 768x768, 124 frames, prompt only | 51.6 GB Qwen + 43.2 GB DiT | 7.5 s | 20.1 s |
-| MiniMax H3 Ref2VA | 768x768, 124 frames, one reference image | 51.6 GB Qwen + 44.1 GB DiT + 0.7 GB video encoder | 10.0 s | 18.5 s |
-| Wan 2.1 I2V-14B 720P | the official example, 832x1104, 81 frames | 32.8 GB DiT + 14.4 GB encoders | 7.4 s | 14.0 s |
-| LTX 2.5 T2V | 1472x832, 49 frames | 42.0 GB DiT + 26.2 GB Gemma + 2.5 GB VAE and upscaler | 7.8 s | 13.8 s |
-| MiniMax H3 FL2VA, `--gpus 2` | 768x768, 124 frames, prompt only | 51.6 GB Qwen + 2 × (20.1 GB DiT half + 2.8 GB) | 7.2 s | 14.0 s |
-| Wan 2.1 I2V-14B 720P, `--gpus 2` | the official example, 832x1104, 81 frames | 32.8 GB DiT + 14.4 GB encoders; the second GPU copies the DiT from the first | 7.4 s | 14.0 s |
-| LTX 2.5 T2V, `--gpus 2` | 1472x832, 49 frames | 42.0 GB DiT + 26.2 GB Gemma + 2.5 GB VAE and upscaler; the second GPU copies the DiT from the first | 6.6 s | 14.4 s |
+| MiniMax H3 FL2VA | 768x768, 124 frames, prompt only | 51.6 GB Qwen + 43.2 GB DiT | 6.0 s | 9.0 s |
+| MiniMax H3 Ref2VA | 768x768, 124 frames, one reference image | 51.6 GB Qwen + 44.1 GB DiT + 0.7 GB video encoder | 7.8 s | 16.1 s |
+| Wan 2.1 I2V-14B 720P | the official example, 832x1104, 81 frames | 32.8 GB DiT + 14.4 GB encoders | 7.9 s | 16.3 s |
+| LTX 2.5 T2V | 1472x832, 49 frames | 42.0 GB DiT + 26.2 GB Gemma + 2.5 GB VAE and upscaler | 6.6 s | 20.5 s |
+| MiniMax H3 FL2VA, `--gpus 2` | 768x768, 124 frames, prompt only | 51.6 GB Qwen + 2 × (20.1 GB DiT half + 2.8 GB) | 7.6 s | 11.2 s |
+| Wan 2.1 I2V-14B 720P, `--gpus 2` | the official example, 832x1104, 81 frames | 32.8 GB DiT + 14.4 GB encoders; the second GPU copies the DiT from the first | 8.7 s | 13.8 s |
+| LTX 2.5 T2V, `--gpus 2` | 1472x832, 49 frames | 42.0 GB DiT + 26.2 GB Gemma + 2.5 GB VAE and upscaler; the second GPU copies the DiT from the first | 6.5 s | 22.3 s |
 
-Ref2VA (with Wan's example image as the reference) is four rounds, which varied most: P50 7.8, 10.2,
-15.4 and 8.9 s. Its own DiT files had been read far less often than FL2VA's.
+Ref2VA uses Wan's example image as the reference. H3's first round ran on hosts that had not read
+its files for hours, and its P50s were 14.2 s (FL2VA), 11.8 s (FL2VA, two GPUs) and 21.9 s (Ref2VA).
 
 `--gpus 2` runs on a B200:2 container, with byte-identical output. H3 runs its DiT as two
 context-parallel ranks (FL2VA generates in 54 s instead of 80 s), and each rank reads only its half
@@ -69,13 +70,7 @@ guidance on the second GPU (its 40 steps take 201 s instead of 400 s), which cop
 first over the peer link in about 40 ms. LTX's second GPU copies the 48 DiT blocks from the first and
 runs them sequence parallel, each GPU taking half of the video tokens (a warm request's two sampling
 stages take 1.5–1.6 s instead of 1.8–2.0 s). In each case the container reads about as much as one GPU
-does. The two-GPU rows above are rounds 2 and 3; the first two-GPU round on these hosts had a P50 of
-11.3 s (H3), 10.1 s (Wan) and 7.5 s (LTX). LTX's two-GPU row was measured a day after its one-GPU
-row, on hosts that had read its files more often: 30 containers of each, started together, both had
-a P50 of 7.1 s. That row predates sequence parallelism, when the second GPU copied only blocks 24-47.
-On 2026-11-09, 30 containers of each build, started together, gave a two-GPU P50 of 6.5 s with
-sequence parallelism and 6.7 s without it. That was one round on hosts that had not cached the
-Volume, so the P90s were 22.3 s and 34.7 s.
+does.
 
 ### Warm Volumes
 
@@ -88,9 +83,9 @@ warm the GPU hosts. Rounds of 30 cold starts on newly written files, overall P50
 | Wan 2.1, new 64 MiB layout (rounds 1–2 with an earlier stage order) | 9.5 s | 8.0 s | 7.2 s |
 | LTX 2.5, new 64 MiB layout (ten containers just after writing it: 88 s each) | 22.5 s | 9.4 s | 8.8 s |
 
-To reproduce the table, run the example once with the same options, then rounds of 30 cold starts
-until the P50 stops falling, and pool the last two rounds. Even on a warm Volume, the P50 of one
-round of 30 moves by 1–2 s from round to round.
+To measure a row, run the example once with the same options, then rounds of 30 cold starts until
+the P50 stops falling, and pool the last two rounds. Even on a warm Volume, the P50 of one round of
+30 moves by 1–2 s from round to round.
 
 ```sh
 modal run examples/modal/wan21.py --cold-start 30   # or h3.py, or ltx25.py
@@ -133,8 +128,8 @@ start-up warm-up. Most of their time is server start: SGLang runs three warm-up 
 read the Diffusers checkpoint, which stores the DiT and text encoder in FP32 (90 GB in all);
 native-video-inference reads the BF16 layout it prepared once from the official checkpoint
 (47 GB). vLLM-Omni does not list Wan 2.1 I2V as supported, but serves it. Our P50 varied that day
-from 8.0 to 13.8 s over five rounds of 30, against 7.4 s in the table above, measured on 2026-10-31;
-the code of both days gave the same P50 when started together.
+from 8.0 to 13.8 s over five rounds of 30, against 7.4 s measured on 2026-10-31; the code of both
+days gave the same P50 when started together.
 
 A warm request is timed inside the container, from receiving the request to the finished video, as
 the second of two back-to-back identical requests; both servers then reuse the first request's text
