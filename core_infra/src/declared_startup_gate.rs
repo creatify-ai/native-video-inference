@@ -67,7 +67,7 @@ impl StartupGate {
         let message: Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
         let scope = message["scope"].as_str().filter(|s| !s.is_empty()).ok_or("startup gate scope missing")?;
         let kind = message["kind"].as_str().ok_or("startup gate kind missing")?;
-        let outcome = (|| {
+        let outcome: Result<()> = (|| {
             if message["schema"] != SCHEMA || message["token"] != token { return Err("startup gate frame differs from its admitted request".into()); }
             match kind {
                 "inputs" => {
@@ -84,7 +84,11 @@ impl StartupGate {
             Ok(())
         })();
         let mut reply = json!({"schema":SCHEMA,"token":token,"kind":kind,"scope":scope,"continued":outcome.is_ok()});
-        if let Err(error) = &outcome { reply["error"] = json!(error); }
+        if let Err(error) = &outcome {
+            reply["error"] = json!(error);
+            // Record the failure before the peer sees the reply, so a poll that follows the reply reports it.
+            if !closed.load(Ordering::Acquire) { state.lock().unwrap().error.get_or_insert_with(|| error.clone()); }
+        }
         let mut bytes = serde_json::to_vec(&reply).map_err(|e| e.to_string())?; bytes.push(b'\n');
         stream.write_all(&bytes).map_err(|e| e.to_string())?;
         outcome
