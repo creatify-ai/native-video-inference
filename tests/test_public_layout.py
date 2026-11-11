@@ -16,6 +16,7 @@ MEMBERS = {
     f"{H3}/video_vae", f"{H3}/video_vae/router", f"{H3}/audio_vae",
     "models/wan2.1",
     "models/ltx25",
+    "models/deepseek_v4_flash",
 }
 VENDORED = {"vendor/native-tokenizers"}
 ML_FRAMEWORKS = {"torch", "triton", "diffusers", "transformers", "peft"}
@@ -50,8 +51,9 @@ def test_workspace_is_self_contained():
 
 
 def offline(path):
-    """One-time checkpoint preparation and kernel export may use PyTorch; inference may not."""
-    return any("prepare" in part or part.endswith("_export.py") for part in path.relative_to(ROOT).parts)
+    """One-time checkpoint preparation, kernel export and reference capture (a model's `reference/`
+    tools, which run the reference framework itself) may use PyTorch; inference may not."""
+    return any("prepare" in part or part.endswith("_export.py") or part == "reference" for part in path.relative_to(ROOT).parts)
 
 
 def test_inference_imports_need_no_ml_framework():

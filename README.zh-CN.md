@@ -16,6 +16,22 @@
 
 从 PyTorch、SGLang 或 vLLM 过来？[FAQ](docs/faq.zh-CN.md)（[English](docs/faq.md)）解释了背后的设计决策，把速度和 cold start 与 SGLang、vLLM-Omni 做了对比，并给出这些框架的概念在本仓库中的对应。
 
+## LLM：DeepSeek-V4
+
+同样的方法也能用来服务大型 LLM。这不在本仓库的重点（视频生成）之内，但它表明
+这个规模的模型可以在不改变任何一个输出 bit 的前提下，把启动时间从分钟级降到秒级。Flash 的移植在
+正确性和性能上都已就绪；Pro 的移植是正确的，但没有做性能调优。两个移植都在
+NVIDIA B300 上重放 SGLang 自己的 kernel，并读取预先准备好的权重包。
+
+| 模型 | 硬件 | 输出 | 吞吐 | 冷启动：SGLang → native |
+| --- | --- | --- | --- | --- |
+| [DeepSeek-V4-Flash](models/deepseek_v4_flash/README.md)（NVFP4，284 B 参数，165 GB） | 1 张 B300 | 与 SGLang 逐位一致 | 与 SGLang 持平，差距 0–4%（16k–131k 上下文、32–256 并发、MTP） | 9–27 分钟 → **7–9 秒** |
+| [DeepSeek-V4-Pro](models/deepseek_v4_pro/README.md)（NVFP4，928.5 GB） | 8 张 B300（`--tp 8`） | 第一个 token 和 logits 与 SGLang 逐位一致 | 未做：只做了冷启动和正确性 | 19.8 分钟 → **26.5 秒** |
+
+SGLang 的数字是原版 server 从启动到 ready；native 的数字是在读过权重包的主机上，从进程启动到
+第一个 token，不含容器启动。Modal 的 Volume 缓存按主机算，不按 region 算：在没读过这个包的主机上，
+Flash 需要 16–142 秒，Pro 需要 212 秒。方法、测量数据和限制见各模型的 README（英文）。
+
 ## Cold start
 
 各示例默认请求的 cold start：用 `--cold-start` 在 Modal `us-west` 的全新一次性 B200 容器上测得（16 CPU，192 GiB；`--gpus 2` 时为 B200:2；H3 为 256 GiB），计时从第一行用户代码到第一个 DiT step，同时最多 10 个容器，测于 2026-11-09 和 2026-11-10，测之前按[下文](#预热-volume)的方法预热了 Volume。H3 的行合并了第 2、3 轮（每轮 30 个）；Wan 和 LTX 的行各是一轮 30 个，所以它们的 P90 包含了还没缓存 Volume 的主机：
