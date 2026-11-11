@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="238" viewBox="0 0 760 238" font-family="system-ui, -apple-system, &quot;Segoe UI&quot;, Helvetica, Arial, sans-serif" role="img" aria-label="One request on one worker. With a 70 second startup, a 70 second generation and 140 seconds of idle retention, generation is 25% of the allocated time, 50% if the worker is released at once, and the first video takes 2.0× as long as a warm one. With a 7 second startup and 14 seconds of retention it is 77%, 91% and 1.10×."><style>text{fill:#52514e}.lbl{fill:#0b0b0b}.mut{fill:#898781}.num{font-variant-numeric:tabular-nums}</style><rect width="100%" height="100%" rx="6" fill="#fcfcfb"/>
+<rect x="214" y="12" width="12" height="12" rx="2" style="fill:#eb6834"/><text x="232.0" y="22.0" text-anchor="start" font-size="12.5">Startup</text>
+<rect x="302" y="12" width="12" height="12" rx="2" style="fill:#2a78d6"/><text x="320.0" y="22.0" text-anchor="start" font-size="12.5">Generation, 70 s</text>
+<rect x="444" y="12" width="12" height="12" rx="2" style="fill:#b8b7b0"/><text x="462.0" y="22.0" text-anchor="start" font-size="12.5">Idle before release, 2 × startup</text>
+<line x1="214.0" y1="48" x2="214.0" y2="206" style="stroke:#e1e0d9" stroke-width="1"/>
+<text x="214.0" y="221.0" text-anchor="middle" font-size="11" class="mut num">0</text>
+<line x1="318.4" y1="48" x2="318.4" y2="206" style="stroke:#e1e0d9" stroke-width="1"/>
+<text x="318.4" y="221.0" text-anchor="middle" font-size="11" class="mut num">60 s</text>
+<line x1="422.9" y1="48" x2="422.9" y2="206" style="stroke:#e1e0d9" stroke-width="1"/>
+<text x="422.9" y="221.0" text-anchor="middle" font-size="11" class="mut num">120 s</text>
+<line x1="527.3" y1="48" x2="527.3" y2="206" style="stroke:#e1e0d9" stroke-width="1"/>
+<text x="527.3" y="221.0" text-anchor="middle" font-size="11" class="mut num">180 s</text>
+<line x1="631.8" y1="48" x2="631.8" y2="206" style="stroke:#e1e0d9" stroke-width="1"/>
+<text x="631.8" y="221.0" text-anchor="middle" font-size="11" class="mut num">240 s</text>
+<line x1="214" y1="48" x2="214" y2="206" style="stroke:#c3c2b7" stroke-width="1"/>
+<text x="684.0" y="237.0" text-anchor="end" font-size="10.5" class="mut">seconds of GPU time allocated to one request</text>
+<text x="202.0" y="68.0" text-anchor="end" font-size="12.5" font-weight="600" class="lbl">SGLang Diffusion / vLLM-Omni</text>
+<text x="202.0" y="83.0" text-anchor="end" font-size="11" class="mut">70 s startup</text>
+<path d="M214.0,58.0 h120.4 v24.0 h-120.4 z" style="fill:#eb6834"><title>SGLang Diffusion / vLLM-Omni · startup: 70 s</title></path>
+<text x="274.9" y="74.0" text-anchor="middle" font-size="10.5" style="fill:#ffffff">startup 70 s</text>
+<path d="M335.9,58.0 h120.4 v24.0 h-120.4 z" style="fill:#2a78d6"><title>SGLang Diffusion / vLLM-Omni · generation: 70 s</title></path>
+<text x="396.8" y="74.0" text-anchor="middle" font-size="10.5" style="fill:#ffffff">generation 70 s</text>
+<path d="M457.7,58.0 h239.7 a4,4 0 0 1 4,4 v16.0 a4,4 0 0 1 -4,4 h-239.7 z" style="fill:#b8b7b0"><title>SGLang Diffusion / vLLM-Omni · idle: 140 s</title></path>
+<text x="579.6" y="74.0" text-anchor="middle" font-size="10.5" class="lbl">idle 140 s</text>
+<text x="709.4" y="74.5" text-anchor="start" font-size="11.5" class="num">280 s</text>
+<text x="214.0" y="99.0" text-anchor="start" font-size="11.5" class="lbl">25% generation  ·  50% if released at once  ·  first video takes 2.0× as long</text>
+<text x="202.0" y="144.0" text-anchor="end" font-size="12.5" font-weight="600" class="lbl">Ours</text>
+<text x="202.0" y="159.0" text-anchor="end" font-size="11" class="mut">7 s startup</text>
+<path d="M214.0,134.0 h10.7 v24.0 h-10.7 z" style="fill:#eb6834"><title>Ours · startup: 7 s</title></path>
+<path d="M226.2,134.0 h120.4 v24.0 h-120.4 z" style="fill:#2a78d6"><title>Ours · generation: 70 s</title></path>
+<text x="287.1" y="150.0" text-anchor="middle" font-size="10.5" style="fill:#ffffff">generation 70 s</text>
+<path d="M348.0,134.0 h20.4 a4,4 0 0 1 4,4 v16.0 a4,4 0 0 1 -4,4 h-20.4 z" style="fill:#b8b7b0"><title>Ours · idle: 14 s</title></path>
+<text x="380.4" y="150.5" text-anchor="start" font-size="11.5" class="num">91 s</text>
+<text x="214.0" y="175.0" text-anchor="start" font-size="11.5" class="lbl">77% generation  ·  91% if released at once  ·  first video takes 1.10× as long</text>
+</svg>

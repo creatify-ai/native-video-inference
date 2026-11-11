@@ -35,6 +35,157 @@ The framework does not infer a model graph or discover its dependencies from a
 prompt. The adapter declares them. Tensor wrappers remain thin and model-specific;
 this protocol does not require a universal Tensor API, autograd or CUDA Graph replay.
 
+## How a cold start loads a model
+
+A cold start ends at the first DiT step. Before it, three kinds of work run at once, and each item
+waits only for what it really needs. An interactive version of this section, with every declared
+dependency, is in [`profiling/startup-dependencies.html`](profiling/startup-dependencies.html)
+([中文](profiling/startup-dependencies.zh-CN.html)), and real container timelines of all three
+models are in [`profiling/startup-profile.html`](profiling/startup-profile.html)
+([中文](profiling/startup-profile.zh-CN.html)). GitHub shows HTML files as source, so open them in
+a browser from a checkout.
+
+### Three kinds of work
+
+| Kind | What it does | Waits for |
+| --- | --- | --- |
+| **Model preparation** | Starts the native owner process, creates its CUDA context and streams, restores attention plans from a recorded bundle, loads kernel modules, builds model objects over loaded weights, and allocates request-sized scratch | The process for the CPU parts; the CUDA context for GPU state; a component's weights for its constructor |
+| **Weight preparation** | Admits the checkpoint manifest, reads tensor bytes into bounded host buffers, checks light guards, copies chunks to the GPU, converts dtypes on the device and confirms each copy | The manifest for reads; the CUDA context and a filled buffer for each copy |
+| **Request preparation** | Tokenizes prompts and preprocesses images on the CPU, runs the encoders, assembles conditioning and prepares the DiT's request layout | Request inputs for CPU work; an encoder's weights and plans for its forward; DiT weights for the layout |
+
+These are not three APIs. One declared callback can contain more than one kind; for example, a
+native load callback can create the context, start readers and upload weights. The executor
+schedules declared callbacks, so splitting work into separate callbacks is what lets it overlap.
+
+### From file to GPU
+
+```mermaid
+flowchart LR
+    subgraph Host
+        Manifest[Checkpoint manifest: tensor ranges, dtypes, guards] --> Readers[Reader pool]
+        Readers --> Pool[Bounded buffer pool: 32 MiB chunks]
+        Pool --> Guard[First/last-KiB guard]
+    end
+    subgraph Device
+        Context[CUDA context and upload stream] --> Register[Register filled buffers for DMA]
+        Register --> Copy[Asynchronous H2D copy per chunk]
+        Copy --> Done[Copy event: chunk landed]
+        Done --> Views[Dtype conversion and views for the model]
+    end
+    Guard --> Register
+    Done -. buffer returns .-> Pool
+```
+
+Readers start before the CUDA context exists, so file reads overlap context creation. Each reader
+fills a buffer from a pool whose size is declared up front (`NATIVE_LOAD_BUDGET_MIB`, or a model's
+`ReaderBudget`); the whole checkpoint never sits in pinned memory. Once the context is ready, filled
+buffers are registered for DMA and copied in 32 MiB chunks on an upload stream, so later reads
+overlap earlier copies. A returned `cudaMemcpyAsync` call does not mean the bytes have landed: the
+loader waits for each copy's event before it reuses the buffer or hands the tensor to the model.
+The [loader policy](fast-cold-start.md#loader-policy-native_load_) lists the settings.
+
+### Wan 2.1
+
+Wan loads one checkpoint in three ordered stages: the VAE (0.5 GB) first so its image encode can
+start early, then T5 and CLIP together, then the DiT, which streams in while the encoders run.
+
+```mermaid
+flowchart LR
+    Readers[Readers and CUDA context] --> VAE[Stage 0: VAE weights]
+    VAE --> Encoders[Stage 1: T5 and CLIP weights]
+    Encoders --> DiTw[Stage 2: DiT weights]
+    Request[Request] --> Backend[request-backend: tokenizer and image on CPU, then attention plans]
+    Backend --> VAEm[vae-model]
+    VAE --> VAEm
+    Backend --> Encm[encoder-models]
+    Encoders --> Encm
+    VAEm --> Cond[Conditioning: VAE encode, T5, CLIP]
+    Encm --> Cond
+    Cond --> DiTm[dit-model at first use: DiT and request scratch]
+    DiTw --> DiTm
+    DiTm --> First[First DiT step]
+```
+
+`dit-model` is built at first use, after conditioning, so the encoders' activations are freed
+before the DiT's request scratch is allocated. One reader pool serves all stages: 24 readers, 32 MiB
+chunks, 4 upload slots, and direct file reads in the Modal example
+([Wan architecture](../models/wan2.1/architecture.md#cold-startup)).
+
+### MiniMax H3
+
+Each H3 component is its own native owner process with its own CUDA context and reader pool. The
+encoders the request needs and the DiT load in parallel, and a file prefetch reads ahead for Qwen
+and the DiT. The video decoder and audio VAE load only when first used, after the input components,
+so they are not part of the path to the first DiT step.
+
+```mermaid
+flowchart LR
+    Request[Request] --> Backend[backend: plan bundle]
+    Qwen[Qwen text encoder owner] --> Text[condition-text]
+    Backend --> Text
+    VEnc[Video encoder owner, with image or video inputs] --> Video[condition-video]
+    Backend --> Video
+    AEnc[Audio encoder owner, Ref2VA with audio] --> Audio[condition-audio]
+    Backend --> Audio
+    Text --> Assemble[condition-assemble]
+    Video --> Assemble
+    Audio --> Assemble
+    Request --> Shape[request-shape-layout: CPU structure, then DiT layout]
+    Backend --> Shape
+    DiT[DiT owner] --> Shape
+    Shape --> Layout[request-layout]
+    Assemble --> Layout
+    DiT --> Layout
+    Layout --> First[First DiT step]
+```
+
+The CPU part of the request structure does not wait for DiT weights; the GPU layout does. In Ref2VA,
+video and audio conditioning share one serial group, so they run one at a time.
+
+| Component | Readers | Host buffer budget |
+| --- | ---: | ---: |
+| Qwen text encoder | 24 | 1.6 GiB |
+| DiT | 24 | 1.6 GiB |
+| Video encoder | 6 | 1 GiB |
+| Video decoder | 8 | 0.6 GiB |
+| Audio VAE, audio encoder | 4 each | 0.4 GiB, 0.5 GiB |
+
+Chunks are 32 MiB with 4 upload slots; the budget is (2 × readers + 4) × 32 MiB, with a floor for
+the encoders ([`runtime/startup.py`](../models/minimax_h3_official/runtime/startup.py)).
+
+### LTX 2.5
+
+LTX's five weight groups load independently from one shared reader pool, each with its own uploads.
+A group is installed into LTX's tensor cache when it is first used.
+
+```mermaid
+flowchart LR
+    Readers[Shared reader pool and CUDA context] --> TextW[text: Gemma]
+    Readers --> ConnW[connectors]
+    Readers --> DiTw[dit]
+    Readers --> VAEw[vae]
+    Readers --> UpW[upscale]
+    Tok[model-tokenizer on CPU] --> IText[install-text]
+    TB[text-backend: text processor attention plans] --> IText
+    TextW --> IText
+    IText --> IConn[install-connectors]
+    ConnW --> IConn
+    TB --> IConn
+    IConn --> Enc[Text encoding and connectors]
+    DiTw --> IDiT[install-dit]
+    VAEw --> IVAE[install-vae]
+    UpW --> IUp[install-upscale]
+    Enc --> First[First DiT step]
+    IDiT --> First
+    IVAE --> First
+    IUp --> First
+```
+
+Before sampling, the request enters the DiT, VAE and upscaler together, so the first DiT step waits
+for all three to install; the DiT, the largest group, usually lands last. The Modal example runs 48
+readers with 32 MiB chunks and direct file reads
+([LTX architecture](../models/ltx25/architecture.md#what-ltx-declares)).
+
 ## The supported startup path
 
 A maintained framework adapter follows this path:

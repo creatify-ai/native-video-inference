@@ -10,6 +10,7 @@ __pycache__/
 # Model assets and inference output
 /artifacts/
 /outputs/
+/traces/
 *.safetensors
 *.bin
 *.pt

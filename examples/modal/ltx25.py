@@ -18,15 +18,15 @@ PyTorch. Prompt, seed and image change per request.
     modal run examples/modal/ltx25.py --cold-start 30
 
 measures the cold start of a prepared profile's own request on 30 fresh containers, at most ten at a
-time, each stopped at its first DiT step, and prints the P50 and P90.
+time (--parallel K changes that), each stopped at its first DiT step, and prints the P50 and P90.
 
 --gpus 2 runs on a B200:2 container: the DiT blocks run sequence parallel, each GPU taking half of
 the video tokens. The second GPU copies the blocks from the first over the peer link, so the Volume
 is read once, as with one GPU. Works with --cold-start too.
 
 Settings: LTX25_VOLUME (default ltx25-native), LTX25_MOUNT (default /vol; profiles record absolute
-paths under it, so keep it fixed for a Volume), LTX25_HF_SECRET (a Modal Secret with HF_TOKEN),
-COLD_START_REGION (a Modal region for cold_start, such as us-west; region pinning costs extra).
+paths under it, so keep it fixed for a Volume), LTX25_HF_SECRET (a Modal Secret with HF_TOKEN;
+the first run needs it, because the weights are gated on Hugging Face), COLD_START_REGION (a Modal region for cold_start, such as us-west; region pinning costs extra).
 """
 import json
 import os
@@ -66,6 +66,9 @@ PROMPT = "A lighthouse beam sweeps across a stormy sea at night, waves crashing 
 VOLUME_NAME = os.environ.get("LTX25_VOLUME", "ltx25-native")
 MOUNT = os.environ.get("LTX25_MOUNT", "/vol")
 HF_SECRET = os.environ.get("LTX25_HF_SECRET", "")
+GATED = (f"LTX 2.5's weights are gated on Hugging Face. Accept the license at https://huggingface.co/{MODEL_REPO} "
+         "while logged in, store a token of that account in Modal (modal secret create huggingface HF_TOKEN=hf_...), "
+         "then run again with LTX25_HF_SECRET=huggingface.")
 if not MOUNT.startswith("/") or MOUNT == "/" or ".." in Path(MOUNT).parts:
     raise SystemExit("LTX25_MOUNT must be an absolute subdirectory")
 WEIGHTS_DIR = f"{MOUNT}/weights/{MODEL_REVISION}"
@@ -163,7 +166,9 @@ native = (
 downloader = modal.Image.debian_slim(python_version="3.12").uv_pip_install("huggingface_hub")
 if REPO:  # this repository: the whole workspace for Cargo, the core runtime for checkpoint hashing
     native = native.add_local_dir(REPO, "/opt/native-video-inference", copy=True, ignore=[
-        ".git", ".git/**", "target", "target/**", ".venv", ".venv/**", "**/__pycache__/**"])
+        ".git", ".git/**", "target", "target/**", ".venv", ".venv/**", "**/__pycache__/**",
+        # Outputs and inputs saved next to the checkout would otherwise change the image and rebuild it.
+        "**/*.mp4", "**/*.wav", "**/*.png", "**/*.jpg", "**/*.jpeg", "traces/**"])
     downloader = downloader.add_local_dir(REPO / "core_infra/runtime",
                                           "/opt/native-video-inference/core_infra/runtime",
                                           copy=True, ignore=["**/__pycache__/**"])
@@ -374,10 +379,12 @@ def infer(profile: str, request: dict | None, image: bytes | None, run: str, gpu
 
 @app.local_entrypoint()
 def main(prompt: str = "", image: str = "", seed: int = 42, width: int = 1472, height: int = 832, frames: int = 49,
-         fps: int = 24, out: str = "ltx25.mp4", cold_start: int = 0, gpus: int = 1):
+         fps: int = 24, out: str = "ltx25.mp4", cold_start: int = 0, gpus: int = 1, trace: str = "",
+         parallel: int = 10):
     """One request. Without --prompt, replay the profile's capture request and check it against the reference.
     --cold-start N instead measures the cold start of the profile's own request on N fresh containers.
-    --gpus 2 runs the DiT blocks sequence parallel on two GPUs."""
+    --gpus 2 runs the DiT blocks sequence parallel on two GPUs.
+    --trace DIR with --cold-start also saves each container's startup trace (NATIVE_STARTUP_TRACE_DIR) under DIR."""
     if gpus not in GPUS:
         raise SystemExit("--gpus must be 1 or 2")
     mode = "i2v" if image else "t2v"
@@ -391,11 +398,20 @@ def main(prompt: str = "", image: str = "", seed: int = 42, width: int = 1472, h
         if not all(state.values()):
             raise SystemExit(f"{name} is not prepared yet: run `modal run examples/modal/ltx25.py` with the same options")
         profile = f"{MOUNT}/profiles/{name}/profile.json"
-        measure.collect(on_gpus(cold_start_sample, gpus), cold_start, profile, gpus)
+        sampler = on_gpus(cold_start_sample, gpus, max_containers=measure.parallel(parallel))
+        measure.collect(sampler, cold_start, profile, gpus, bool(trace),
+                        save=trace or None)
         return
     if not state["layout"]:
+        if not HF_SECRET:
+            raise SystemExit(GATED)
         print("First run: downloading the weights and writing their 64 MiB layout (once).")
-        fetch_weights.remote()
+        try:
+            fetch_weights.remote()
+        except Exception as error:  # Hugging Face errors arrive as text: their classes are not installed here
+            if "gated repo" in str(error).lower():
+                raise SystemExit(f"{GATED}\nHugging Face refused the token of {HF_SECRET}: {str(error)[-300:]}") from None
+            raise
     if not state["profile"]:
         print(f"First run for {name}: tracing the reference on a B200 (once).")
         prepare_profile.remote(name, {"mode": mode, "width": width, "height": height, "num_frames": frames,
@@ -418,14 +434,16 @@ def profile_name(image, width, height, frames, fps):
     return f"{'i2v' if image else 't2v'}-{width}x{height}x{frames}" + ("" if fps == 24 else f"-{fps}fps")
 
 
-def on_gpus(function, gpus):
-    """`function` on a container with `gpus` B200s."""
-    return function if gpus == 1 else function.with_options(gpu=f"{GPU}:{gpus}")
+def on_gpus(function, gpus, **options):
+    """`function` on a container with `gpus` B200s, with any other `options`."""
+    if gpus != 1:
+        options["gpu"] = f"{GPU}:{gpus}"
+    return function.with_options(**options) if options else function
 
 
 @app.function(image=native, gpu=GPU, cpu=16, memory=196608, timeout=1800, volumes={MOUNT: volume.read_only()},
               single_use_containers=True, max_containers=10, region=COLD_START_REGION)
-def cold_start_sample(profile: str, gpus: int = 1) -> dict:
+def cold_start_sample(profile: str, gpus: int = 1, trace: bool = False) -> dict:
     """One fresh container: the profile's own request up to its first DiT step, then stop."""
     import subprocess
     import sys
@@ -445,10 +463,11 @@ def cold_start_sample(profile: str, gpus: int = 1) -> dict:
     plans, recorded = backend_plans(Path(profile).parent)
     if recorded:
         raise RuntimeError("this profile has no recorded plans; run `modal run examples/modal/ltx25.py` first")
-    environment = {**native_environment(plans, gpus), **measure.environment(work / "first-dit")}
+    traces = work / "trace" if trace else None
+    environment = {**native_environment(plans, gpus), **measure.environment(work / "first-dit", traces)}
     with open(work / "stderr", "w") as stderr:
         process = subprocess.Popen(["ltx25", "infer", str(work / "profile.json"), str(work / "request.json"),
                                     str(work / "output")], env=environment, stdout=subprocess.DEVNULL, stderr=stderr)
         stamp = measure.wait(work / "first-dit", lambda: process.poll() is None)
         process.kill()
-    return measure.sample(STARTED_NS[0], stamp, (work / "stderr").read_text())
+    return measure.sample(STARTED_NS[0], stamp, (work / "stderr").read_text(), traces)

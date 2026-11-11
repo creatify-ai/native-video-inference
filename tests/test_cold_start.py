@@ -42,3 +42,25 @@ def test_collect_maps_one_call_per_container_and_keeps_failures(capsys):
     assert [s['seconds'] for s in samples] == [7.0, None, 9.0]
     out = capsys.readouterr().out
     assert 'failed: RuntimeError' in out and out.strip().endswith('(2 containers, 1 failed)')
+
+
+def test_trace_round_trip(tmp_path):
+    trace = tmp_path / 'trace'
+    variables = cold_start.environment(tmp_path / 'marker', trace)
+    assert variables['NATIVE_STARTUP_TRACE_DIR'] == str(trace) and variables['NATIVE_STARTUP_TRACE_LEVEL'] == 'io'
+    (trace / 'rust-7.jsonl').write_text('{"kind":"model_load"}\n')
+    result = cold_start.sample(1_000_000_000, 3_000_000_000, '', trace)
+    assert result['seconds'] == 2.0 and result['trace']['first_dit_ns'] == 3_000_000_000
+    cold_start.write_trace(tmp_path / 'saved' / '001', result)
+    assert (tmp_path / 'saved' / '001' / 'rust-7.jsonl').read_text() == '{"kind":"model_load"}\n'
+    assert '"started_ns": 1000000000' in (tmp_path / 'saved' / '001' / 'sample.json').read_text()
+
+
+def test_parallel_is_checked():
+    assert cold_start.parallel(20) == 20
+    for bad in (0, 51, 2.5, '20'):
+        try:
+            cold_start.parallel(bad)
+        except SystemExit:
+            continue
+        raise AssertionError(bad)

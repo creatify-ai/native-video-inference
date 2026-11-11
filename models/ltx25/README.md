@@ -125,8 +125,10 @@ the profile's `reference.mp4` by eye: the containers differ.
 For I2V, add `--image first.jpg` (the first run for that geometry traces with it). `--width`,
 `--height`, `--frames` and `--fps` select another profile. Profiles are written under
 `/profiles/NAME` in the Volume for the example's mount (`LTX25_MOUNT`, default `/vol`); keep the
-mount fixed for a Volume. If your Hugging Face access needs a token, set `LTX25_HF_SECRET` to the
-name of a Modal Secret that provides `HF_TOKEN`.
+mount fixed for a Volume. The weights are gated on Hugging Face: accept the license at
+[Lightricks/LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5), store a token of that account in
+Modal (`modal secret create huggingface HF_TOKEN=hf_...`) and set `LTX25_HF_SECRET=huggingface` for
+the first run. Without it, the example stops before downloading and says so.
 
 The native loader still admits the published checkpoint: tokenizer, configuration and every tensor's
 identity come from the downloaded files and their manifest. Only the reads go to the 64 MiB copy

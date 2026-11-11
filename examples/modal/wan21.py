@@ -16,8 +16,8 @@ count). Later runs go straight to one B200.
 
     modal run examples/modal/wan21.py --cold-start 30
 
-measures the cold start of the request on 30 fresh containers, at most ten at a time, each stopped
-at its first DiT step, and prints the P50 and P90.
+measures the cold start of the request on 30 fresh containers, at most ten at a time (--parallel K
+changes that), each stopped at its first DiT step, and prints the P50 and P90.
 
 --gpus 2 runs on a B200:2 container: the second GPU runs every unconditional DiT pass of
 classifier-free guidance. It copies the DiT weights from the first GPU over the peer link, so the
@@ -168,7 +168,9 @@ cpu_image = (
 if modal.is_local():
     gpu_image = gpu_image.add_local_dir(repository, SOURCE, copy=True, ignore=[
         '.git', '.git/**', 'target', 'target/**', '.venv', '.venv/**', '**/__pycache__/**', '**/*.pyc',
-        '**/.DS_Store', '.github/**', 'docs/**', 'examples/**', 'tests/**', 'tools/**', 'outputs/**', 'artifacts/**'])
+        '**/.DS_Store', '.github/**', 'docs/**', 'examples/**', 'tests/**', 'tools/**', 'outputs/**', 'artifacts/**',
+        # Outputs and inputs saved next to the checkout would otherwise change the image and rebuild it.
+        '**/*.mp4', '**/*.wav', '**/*.png', '**/*.jpg', '**/*.jpeg', 'traces/**'])
 gpu_image = gpu_image.run_function(build_native, cpu=16, memory=131072, timeout=3 * 3600).env(settings)
 cpu_image = cpu_image.env({**settings, 'HF_XET_HIGH_PERFORMANCE': '1'})
 if modal.is_local():
@@ -369,18 +371,21 @@ class Wan21I2V:
             self.service.close()
 
 
-def on_gpus(function, gpus):
-    """`function` (a Modal Function or Cls) on a container with `gpus` B200s."""
-    return function if gpus == 1 else function.with_options(gpu=f'{GPU}:{gpus}')
+def on_gpus(function, gpus, **options):
+    """`function` (a Modal Function or Cls) on a container with `gpus` B200s, with any other `options`."""
+    if gpus != 1:
+        options['gpu'] = f'{GPU}:{gpus}'
+    return function.with_options(**options) if options else function
 
 
 @app.local_entrypoint()
 def main(image: str = '', prompt: str = '', out: str = 'wan21.mp4', seed: int = 42, steps: int = 40, frames: int = 81,
          max_area: int = 1280 * 720, shift: float = 5.0, guide_scale: float = 5.0, negative_prompt: str = '',
-         cold_start: int = 0, gpus: int = 1):
+         cold_start: int = 0, gpus: int = 1, trace: str = '', parallel: int = 10):
     """One I2V request. Defaults are the official 720P settings; an empty negative prompt means the official one.
     --cold-start N instead measures the cold start of the request on N fresh containers (run once first).
-    --gpus 2 runs the unconditional DiT pass on a second GPU."""
+    --gpus 2 runs the unconditional DiT pass on a second GPU.
+    --trace DIR with --cold-start also saves each container's startup trace (NATIVE_STARTUP_TRACE_DIR) under DIR."""
     png = Path(image).read_bytes() if image else None
     if png is not None and not png.startswith(b'\x89PNG\r\n\x1a\n'):
         raise SystemExit('--image must be a PNG (convert other formats first)')
@@ -400,7 +405,9 @@ def main(image: str = '', prompt: str = '', out: str = 'wan21.mp4', seed: int = 
         png = png or example_image.remote()
         if not has_plans.remote(plan_key(request, png)):
             raise SystemExit('Not prepared for this request yet: run it once without --cold-start first')
-        measure.collect(on_gpus(cold_start_sample, gpus), cold_start, request, png, gpus)
+        sampler = on_gpus(cold_start_sample, gpus, max_containers=measure.parallel(parallel))
+        measure.collect(sampler, cold_start, request, png, gpus, bool(trace),
+                        save=trace or None)
         return
     report = prepare_checkpoint.remote()
     if report['manifest_sha256'] != MANIFEST_SHA256:
@@ -432,7 +439,7 @@ def request_spec(prompt='', seed=42, steps=40, frames=81, max_area=1280 * 720, s
 
 @app.function(image=gpu_image, gpu=GPU, cpu=16, memory=196608, timeout=1800, volumes={MOUNT: volume.read_only()},
               single_use_containers=True, max_containers=10, region=COLD_START_REGION)
-def cold_start_sample(request: dict, image: bytes, gpus: int = 1) -> dict:
+def cold_start_sample(request: dict, image: bytes, gpus: int = 1, trace: bool = False) -> dict:
     """One fresh container: `request` up to its first DiT step, then stop."""
     import sys
     import threading
@@ -441,7 +448,8 @@ def cold_start_sample(request: dict, image: bytes, gpus: int = 1) -> dict:
     from core_infra.runtime import cold_start as measure
     work = Path(tempfile.mkdtemp(prefix='wan21-cold-start-'))
     (work / 'image.png').write_bytes(image)
-    service = native_service(str(work / 'owner'), measure.environment(work / 'first-dit'), plans=backend_plans(),
+    traces = work / 'trace' if trace else None
+    service = native_service(str(work / 'owner'), measure.environment(work / 'first-dit', traces), plans=backend_plans(),
                              gpus=gpus).start()
     spec = {**request, 'image': str(work / 'image.png'), 'out': str(work / 'out.mp4')}
     errors = []
@@ -453,4 +461,4 @@ def cold_start_sample(request: dict, image: bytes, gpus: int = 1) -> dict:
             errors.append(repr(error))
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    return measure.sample(STARTED_NS, measure.wait(work / 'first-dit', thread.is_alive), ''.join(errors))
+    return measure.sample(STARTED_NS, measure.wait(work / 'first-dit', thread.is_alive), ''.join(errors), traces)
