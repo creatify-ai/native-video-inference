@@ -36,8 +36,8 @@ their SHA-256 in report.json. The MP4 is downloaded to --out.
 
     modal run examples/modal/h3.py --cold-start 30
 
-measures the cold start of the request on 30 fresh containers, at most ten at a time, each stopped
-at its first DiT step, and prints the P50 and P90.
+measures the cold start of the request on 30 fresh containers, at most ten at a time (--parallel K
+changes that), each stopped at its first DiT step, and prints the P50 and P90.
 
 --gpus 2 runs the DiT as two context-parallel ranks on a B200:2 container (Qwen, the encoders and
 the decoders stay on the first GPU). Each rank keeps half of every layer's
@@ -173,7 +173,9 @@ image = (
 if modal.is_local():
     image = image.add_local_dir(repository, SOURCE, copy=True, ignore=[
         '.git', '.git/**', 'target', 'target/**', '.venv', '.venv/**', '**/__pycache__/**', '**/*.pyc',
-        '**/.DS_Store', '.github/**', 'docs/**', 'tests/**', 'outputs/**', 'artifacts/**'])
+        '**/.DS_Store', '.github/**', 'docs/**', 'tests/**', 'outputs/**', 'artifacts/**',
+        # Outputs and inputs saved next to the checkout would otherwise change the image and rebuild it.
+        '**/*.mp4', '**/*.wav', '**/*.png', '**/*.jpg', '**/*.jpeg', 'traces/**'])
     if os.environ.get('H3_SUBBLOCK_EXPORT'):
         image = image.add_local_dir(os.environ['H3_SUBBLOCK_EXPORT'], SUBBLOCK, copy=True)
 image = (image.run_function(export_subblock, gpu=GPU, timeout=3600)
@@ -203,8 +205,13 @@ def prepare_packages(workflow: str, components: str = '', decoder_kernel_configs
         command += ['--components', components]
     if decoder_kernel_configs:
         command += ['--decoder-kernel-configs', decoder_kernel_configs]
-    try:
-        subprocess.run(command, cwd=SOURCE, check=True)
+    try:  # show progress events only; the full report is saved as preparation.json
+        with subprocess.Popen(command, cwd=SOURCE, stdout=subprocess.PIPE, text=True) as process:
+            for line in process.stdout:
+                if line.startswith('{"event"'):
+                    print(line, end='', flush=True)
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, command)
     finally:
         volume.commit()
     return json.loads(Path(prepared(workflow), 'preparation.json').read_bytes())
@@ -279,9 +286,11 @@ def reference_descriptor(image_path, directory, longest_edge=1536):
     return descriptor
 
 
-def on_gpus(function, gpus):
-    """`function` on a container with `gpus` B200s."""
-    return function if gpus == 1 else function.with_options(gpu=f'{GPU}:{gpus}', memory=262144)
+def on_gpus(function, gpus, **options):
+    """`function` on a container with `gpus` B200s, with any other `options`."""
+    if gpus != 1:
+        options.update(gpu=f'{GPU}:{gpus}', memory=262144)
+    return function.with_options(**options) if options else function
 
 
 def with_inputs(request, inputs, directory):
@@ -321,10 +330,11 @@ def infer(config: str, request: dict, inputs: dict, run_id: str) -> dict:
 def main(prompt: str = PROMPT, workflow: str = 'fl2va', first_frame: str = '', last_frame: str = '', reference: str = '',
          reference_descriptor: str = '', width: int = 768, height: int = 768, frames: int = 124, seed: int = 0,
          attention: str = 'subblock_sparse_attn', config: str = '', out: str = '', run_id: str = '',
-         cold_start: int = 0, gpus: int = 1):
+         cold_start: int = 0, gpus: int = 1, trace: str = '', parallel: int = 10):
     """One request. The first run for a workflow downloads the checkpoint and builds its packages.
     --cold-start N instead measures the cold start of the request on N fresh containers (run once first).
-    --gpus 2 runs the DiT on two GPUs."""
+    --gpus 2 runs the DiT on two GPUs.
+    --trace DIR with --cold-start also saves each container's startup trace (NATIVE_STARTUP_TRACE_DIR) under DIR."""
     request, inputs = request_spec(prompt, workflow, first_frame, last_frame, reference, reference_descriptor,
                                    width, height, frames, seed, attention)
     if gpus not in GPUS:
@@ -337,7 +347,9 @@ def main(prompt: str = PROMPT, workflow: str = 'fl2va', first_frame: str = '', l
             raise SystemExit(f'Not prepared yet: run `modal run examples/modal/h3.py --workflow {workflow} '
                              f'--gpus {gpus}` once first')
         config = config or write_config.remote(workflow, attention, gpus)['config']
-        measure.collect(on_gpus(cold_start_sample, gpus), cold_start, config, request, inputs)
+        sampler = on_gpus(cold_start_sample, gpus, max_containers=measure.parallel(parallel))
+        measure.collect(sampler, cold_start, config, request, inputs, bool(trace),
+                        save=trace or None)
         return
     if not config:
         if not is_prepared.remote(workflow):
@@ -385,14 +397,17 @@ def request_spec(prompt, workflow, first_frame, last_frame, reference, reference
 
 @app.function(image=image, gpu=GPU, cpu=16, memory=196608, timeout=1800, volumes={MOUNT: volume.read_only()},
               single_use_containers=True, max_containers=10, region=COLD_START_REGION)
-def cold_start_sample(config: str, request: dict, inputs: dict) -> dict:
+def cold_start_sample(config: str, request: dict, inputs: dict, trace: bool = False) -> dict:
     """One fresh container: one request up to its first DiT step, then stop."""
     import tempfile
     import threading
     from core_infra.runtime import cold_start as measure
     from models.minimax_h3_official.native_pipeline import MiniMaxH3Pipeline
     work = Path(tempfile.mkdtemp(prefix='h3-cold-start-'))
-    os.environ.update(measure.environment(work / 'first-dit'))
+    traces = work / 'trace' if trace else None
+    os.environ.update(measure.environment(work / 'first-dit', traces))
+    if traces:  # H3's native programs read their own trace variable
+        os.environ['H3_STARTUP_TRACE_DIR'] = str(traces)
     request = with_inputs(request, inputs, work)
     errors = []
 
@@ -403,4 +418,4 @@ def cold_start_sample(config: str, request: dict, inputs: dict) -> dict:
             errors.append(repr(error))
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    return measure.sample(STARTED_NS[0], measure.wait(work / 'first-dit', thread.is_alive), ''.join(errors))
+    return measure.sample(STARTED_NS[0], measure.wait(work / 'first-dit', thread.is_alive), ''.join(errors), traces)

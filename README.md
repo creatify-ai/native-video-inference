@@ -1,5 +1,7 @@
 # native-video-inference
 
+English | [中文](README.zh-CN.md)
+
 > **License notice:** If your commercial products and services generate **more than US$10M in
 > yearly revenue**, obtain separate, prior written authorization from Creatify Lab, Inc. before
 > using this software. Contact **support@creatify.ai**. See [LICENSE, Section 2.2](LICENSE).
@@ -8,8 +10,11 @@
 
 A Rust and CUDA inference framework for open video generation models, with no PyTorch at
 inference time. Python only handles requests and process lifetime; every model operation runs in
-native code on the GPU. Each port is validated byte for byte against the official PyTorch pipeline
-on its target GPU.
+native code on the GPU. Wan 2.1 and LTX 2.5 are validated byte for byte against their official
+PyTorch pipelines on the target GPU; MiniMax H3's numerics follow SGLang's H3 implementation at a
+pinned commit. It is built for cold start: a fresh container reaches its first DiT step in about
+6–9 s at P50 while reading 47–96 GB of weights, and warm requests run on the same level as SGLang
+and vLLM-Omni.
 
 | Model | Task | Directory | Modal example |
 | --- | --- | --- | --- |
@@ -20,35 +25,18 @@ on its target GPU.
 Validated on NVIDIA B200 (Linux x86-64). Weights are never stored in this repository; each example
 downloads the official checkpoint into your own Modal Volume.
 
-## Quick start
+Coming from PyTorch, SGLang or vLLM? The [FAQ](docs/faq.md) ([中文](docs/faq.zh-CN.md)) explains
+the design decisions behind it, compares its speed and cold start with SGLang and vLLM-Omni, and maps
+those frameworks' concepts to this repository.
 
-You need a [Modal](https://modal.com) account. Then one command runs a model:
+## Cold start
 
-```sh
-git clone https://github.com/creatify-ai/native-video-inference && cd native-video-inference
-python -m pip install -r examples/requirements-modal.txt
-modal setup
-
-modal run examples/modal/wan21.py     # or h3.py, or ltx25.py
-```
-
-Each command prints the cold start, from container start to the first DiT step:
-
-```text
-cold start  7.2 s (container start to first DiT step)
-generation  446.2 s
-video       wan21.mp4 (832x1104, 81 frames)
-```
-
-The first run does the one-time work on Modal: it builds the CUDA image and native programs from
-this checkout, downloads the official checkpoint into a Modal Volume in your account and prepares
-it. Run the same command again to skip all of that.
-
-Cold start of each example's default request, measured with `--cold-start` (below) on fresh
+Cold start of each example's default request, measured with `--cold-start` on fresh
 single-use B200 containers in Modal `us-west` (16 CPU, 192 GiB; B200:2 with `--gpus 2`, and 256 GiB
 for H3), from the first line of user code to the first DiT step, at most ten containers at a time,
-on 2026-11-09 and 2026-11-10. H3's rows pool rounds 2 and 3 of 30; Wan's and LTX's rows are one
-round of 30 each, so their P90s include hosts that had not yet cached the Volume:
+on 2026-11-09 and 2026-11-10, after warming the Volume as described [below](#warm-volumes). H3's
+rows pool rounds 2 and 3 of 30; Wan's and LTX's rows are one round of 30 each, so their P90s include
+hosts that had not yet cached the Volume:
 
 | Model | Default request | Weights read before the first DiT step | P50 | P90 |
 | --- | --- | --- | ---: | ---: |
@@ -83,27 +71,102 @@ warm the GPU hosts. Rounds of 30 cold starts on newly written files, overall P50
 | Wan 2.1, new 64 MiB layout (rounds 1–2 with an earlier stage order) | 9.5 s | 8.0 s | 7.2 s |
 | LTX 2.5, new 64 MiB layout (ten containers just after writing it: 88 s each) | 22.5 s | 9.4 s | 8.8 s |
 
-To measure a row, run the example once with the same options, then rounds of 30 cold starts until
-the P50 stops falling, and pool the last two rounds. Even on a warm Volume, the P50 of one round of
-30 moves by 1–2 s from round to round.
+To measure the cold start yourself, run the example once (see the [quick start](#quick-start)), then
+run cold starts until the P50 stops falling. One command runs 50 fresh containers, 20 at a time,
+in one region, stops each at its first DiT step and prints the P50 and P90:
 
 ```sh
-modal run examples/modal/wan21.py --cold-start 30   # or h3.py, or ltx25.py
+COLD_START_REGION=us-west modal run examples/modal/h3.py --cold-start 50 --parallel 20   # or wan21.py, or ltx25.py
 ```
 
+With the image already built, one such round took 1 to 2.5 minutes on 2026-11-11, each container
+holding its B200 only until its first DiT step; the first round after a change to the checkout also
+rebuilds the image, 5 to 10 minutes more. Repeat it until the P50 stops falling: the earlier rounds
+warm the hosts, and only the later ones measure the cold start. Even on a warm Volume, the P50 moves
+by 1–2 s from one round to the next. The table above pooled rounds of 30 containers, ten at a time
+(`--cold-start 30`, the default `--parallel 10`).
+
+Pin the region. The cache belongs to the hosts that read the Volume, and pinning a region keeps every
+round on the same pool of hosts, so each round warms more of them. Without it, containers can start
+in other regions, on hosts that have never read the Volume. Rounds of 50 on H3's new Volume from the
+quick-start test, 20 at a time (pinning a region costs extra on Modal):
+
+| H3 FL2VA, new Volume | P50 | P90 | Containers over 15 s |
+| --- | ---: | ---: | ---: |
+| No region pinned | 12.0 s | 21.8 s | 18 of 50 |
+| `us-west`, round 1 | 6.7 s | 35.3 s | 11 of 50 |
+| `us-west`, round 2 | 6.8 s | 12.4 s | 1 of 50 |
+| `us-west`, round 3 | 6.5 s | 16.6 s | 6 of 50 |
+
+In the first pinned round, the slow containers were most likely on hosts of the region that had not
+read the Volume yet; in the next rounds, most hosts had.
+
+From a fresh clone, the whole procedure (the first run, then pinned rounds until the P50 settles)
+takes about 40 to 90 minutes: 30 to 75 for the first run, and a few minutes for three to five
+rounds.
+
 Each container is stopped at its first DiT step; the other options select the request as usual.
-`COLD_START_REGION=us-west` pins the region the table was measured in (pinning a region costs
-extra on Modal). How long warmth lasts depends on the model: Wan's P50 was unchanged after its
+`--trace DIR` also saves each container's startup trace under `DIR`; the
+[startup profile](docs/profiling/startup-profile.html) shows what one records. How long warmth lasts depends on the model: Wan's P50 was unchanged after its
 files sat unread for about 23 hours (8.1, 8.0 and 7.8 s after about 3, 7 and 23 idle hours), while
 H3 FL2VA, which reads twice as much, went from 8.1 to 13.1 s after about 7 idle hours.
 [Fast cold start](docs/fast-cold-start.md) explains the rest of the setup: direct reads, small
 files, recorded plans and overlapped loading.
 
+## Quick start
+
+You need a [Modal](https://modal.com) account. Then one command runs a model:
+
+```sh
+git clone https://github.com/creatify-ai/native-video-inference && cd native-video-inference
+python -m pip install -r examples/requirements-modal.txt
+modal setup
+
+modal run examples/modal/h3.py     # or wan21.py, or ltx25.py
+```
+
+Each command prints the cold start, from container start to the first DiT step:
+
+```text
+cold start  14.6 s (container start to first DiT step)
+generation  78.0 s (49 model evaluations)
+video       h3.mp4 (768x768, 124 frames)
+```
+
+How long the whole command takes, measured from a fresh clone on 2026-11-11 on one B200:
+
+| Model | First run | Second run | of which generating the video |
+| --- | ---: | ---: | ---: |
+| MiniMax H3 | about 75 min | about 2 min | about 1.3 min |
+| Wan 2.1 | about 35 min | about 7.5 min | about 7 min |
+| LTX 2.5 | about 30 min | about 1 min | about 20 s |
+
+The first run does the one-time work on Modal: it builds the CUDA image and native programs from
+this checkout, downloads the official checkpoint into a Modal Volume in your account, prepares it
+and reads it once, and only then generates. The second run skips all of that, so its time is mostly
+the model generating the video.
+
+H3's first run is the longest: about 45 of its 75 minutes go to reading its newly written 105 GB of
+packages once on a CPU container, so that the first GPU container does not pay for the new Volume's
+slow first read. That read ran at only about 40 MB/s. We have not optimized this step in detail and
+there is probably a lot of room, but it runs once per Volume, so we have not prioritized it.
+
+The first run's cold start is slow too (50 to 180 s), because the GPU hosts have not cached the new
+Volume yet. The second run may start on another host, so its cold start (8 to 34 s in our runs) does
+not show the steady state either; measure that on a warm Volume as [above](#warm-volumes). While a
+container reads a new Volume, Modal may print heartbeat warnings; in our runs they did not stop
+anything.
+
+LTX 2.5's weights are gated on Hugging Face. Accept the license at
+[Lightricks/LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5), store a token of that account in
+Modal (`modal secret create huggingface HF_TOKEN=hf_...`) and run
+`LTX25_HF_SECRET=huggingface modal run examples/modal/ltx25.py`. Wan and H3 need no token.
+
 Pass your own input with `--prompt` (and `--image` for Wan, `--first-frame` for H3, `--image` for
 LTX), and `--gpus 2` to run any of them on two B200s; each model README lists its options, pinned
 versions, supported geometry and GPU requirements.
 
-### Compared with SGLang and vLLM-Omni
+## Compared with SGLang and vLLM-Omni
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/cold-start-wan-dark.svg">
@@ -130,6 +193,16 @@ native-video-inference reads the BF16 layout it prepared once from the official 
 (47 GB). vLLM-Omni does not list Wan 2.1 I2V as supported, but serves it. Our P50 varied that day
 from 8.0 to 13.8 s over five rounds of 30, against 7.4 s measured on 2026-10-31; the code of both
 days gave the same P50 when started together.
+
+MiniMax H3's cold start was compared in a larger study: 1,500 containers across three Modal regions,
+with warm-up off in every SGLang and vLLM-Omni configuration. The P50 was 7.2 s natively, against
+64.7–75.0 s for nine SGLang and vLLM-Omni configurations
+([FAQ](docs/faq.md#how-do-cold-starts-compare-with-sglang-and-vllm-omni)).
+[A proposal](docs/sglang-cold-start-proposal.md) brings the same cold-start ideas to SGLang
+Diffusion.
+
+The warm comparisons are not a speed contest. Our focus is cold start; for warm requests, they show
+that inference here is on the same level as SGLang and vLLM-Omni.
 
 A warm request is timed inside the container, from receiving the request to the finished video, as
 the second of two back-to-back identical requests; both servers then reuse the first request's text
@@ -162,6 +235,12 @@ LTX 2.5 (T2V, 1472×832, 49 frames) is compared in one container in its
 the final latents, performance is comparable: 1.92–2.22 s natively against 2.57–2.61 s for SGLang on
 one B200. We claim no two-GPU comparison, because our two-GPU SGLang setup was not verified.
 
+MiniMax H3 (FL2VA, 1376×768, 124 frames, 49 DiT forwards) was compared on one B200 against SGLang,
+vLLM-Omni and the Diffusers pipeline run eagerly, each in the same container: a warm request took
+154.7 s natively, 157.0 s with SGLang, 156.0 s with vLLM-Omni and 200.9 s eagerly, and its sampler
+output matched SGLang's bit for bit
+([FAQ](docs/faq.md#how-do-warm-request-times-compare-with-sglang-and-vllm-omni)).
+
 ## How it is built
 
 ```mermaid
@@ -178,7 +257,10 @@ flowchart LR
 - Each `models/<model>/` crate owns its graph, kernels and preparation, and depends only on core.
 - [Architecture](docs/architecture.md), [fast cold start](docs/fast-cold-start.md),
   [porting a model](docs/porting-a-model.md) and [building from source](docs/build.md) document
-  the protocol.
+  the protocol; the [FAQ](docs/faq.md) answers common questions. The
+  [cold-start post](docs/blog-cold-start.md) explains why startup matters for video
+  serving, and the [SGLang proposal](docs/sglang-cold-start-proposal.md) brings the same ideas to
+  SGLang Diffusion.
 
 ## Check a change
 

@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="300" viewBox="0 0 760 300" font-family="system-ui, -apple-system, &quot;Segoe UI&quot;, Helvetica, Arial, sans-serif" role="img" aria-label="Cold-start study on one B200, ten configurations, three regions pooled: the native runtime reaches the first denoising step at a median of 7.21 seconds; the 4 SGLang Diffusion and vLLM-Omni configurations shown take 64.70 to 73.98 seconds. By region the native median is 5.39, 14.59 and 6.80 seconds."><style>text{fill:#c3c2b7}.lbl{fill:#f0efec}.mut{fill:#898781}.num{font-variant-numeric:tabular-nums}</style><rect width="100%" height="100%" rx="6" fill="#1a1a19"/>
+<rect x="262" y="12" width="12" height="12" rx="2" style="fill:#3987e5"/><text x="280.0" y="22.0" text-anchor="start" font-size="12.5">Ours</text>
+<rect x="342" y="12" width="12" height="12" rx="2" style="fill:#d95926"/><text x="360.0" y="22.0" text-anchor="start" font-size="12.5">SGLang Diffusion</text>
+<rect x="488" y="12" width="12" height="12" rx="2" style="fill:#5a5a55"/><text x="506.0" y="22.0" text-anchor="start" font-size="12.5">vLLM-Omni</text>
+<line x1="262.0" y1="50" x2="262.0" y2="178" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="262.0" y="194.0" text-anchor="middle" font-size="11" class="mut num">0</text>
+<line x1="372.0" y1="50" x2="372.0" y2="178" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="372.0" y="194.0" text-anchor="middle" font-size="11" class="mut num">30 s</text>
+<line x1="482.0" y1="50" x2="482.0" y2="178" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="482.0" y="194.0" text-anchor="middle" font-size="11" class="mut num">60 s</text>
+<line x1="592.0" y1="50" x2="592.0" y2="178" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="592.0" y="194.0" text-anchor="middle" font-size="11" class="mut num">90 s</text>
+<line x1="702.0" y1="50" x2="702.0" y2="178" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="702.0" y="194.0" text-anchor="middle" font-size="11" class="mut num">120 s</text>
+<line x1="262" y1="50" x2="262" y2="178" style="stroke:#383835" stroke-width="1"/>
+<text x="252.0" y="72.0" text-anchor="end" font-size="11.5" font-weight="600" class="lbl">Ours</text>
+<path d="M262.0,60.0 h22.4 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-22.4 z" style="fill:#3987e5"><title>Ours: P50 7.21 s, P90 19.88 s</title></path>
+<rect x="293.4" y="61" width="44.4" height="14" style="fill:#1a1a19"/>
+<text x="296.4" y="72.0" text-anchor="start" font-size="11.5" class="num">7.21 s</text>
+<text x="252.0" y="96.0" text-anchor="end" font-size="11.5" class="lbl">SGLang · short startup, direct GPU loading</text>
+<path d="M262.0,84.0 h233.2 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-233.2 z" style="fill:#d95926"><title>SGLang · short startup, direct GPU loading: P50 64.70 s, P90 119.31 s</title></path>
+<rect x="504.2" y="85" width="108.4" height="14" style="fill:#1a1a19"/>
+<text x="507.2" y="96.0" text-anchor="start" font-size="11.5" class="num">64.70 s  ·  9.0×</text>
+<text x="252.0" y="120.0" text-anchor="end" font-size="11.5" class="lbl">SGLang · recommended configuration</text>
+<path d="M262.0,108.0 h235.8 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-235.8 z" style="fill:#d95926"><title>SGLang · recommended configuration: P50 65.40 s, P90 121.16 s</title></path>
+<rect x="506.8" y="109" width="108.4" height="14" style="fill:#1a1a19"/>
+<text x="509.8" y="120.0" text-anchor="start" font-size="11.5" class="num">65.40 s  ·  9.1×</text>
+<text x="252.0" y="144.0" text-anchor="end" font-size="11.5" class="lbl">vLLM-Omni · offline default</text>
+<path d="M262.0,132.0 h258.2 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-258.2 z" style="fill:#5a5a55"><title>vLLM-Omni · offline default: P50 71.50 s, P90 126.03 s</title></path>
+<rect x="529.2" y="133" width="108.4" height="14" style="fill:#1a1a19"/>
+<text x="532.2" y="144.0" text-anchor="start" font-size="11.5" class="num">71.50 s  ·  9.9×</text>
+<text x="252.0" y="168.0" text-anchor="end" font-size="11.5" class="lbl">vLLM-Omni · recommended HTTP, 4 loaders</text>
+<path d="M262.0,156.0 h267.3 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-267.3 z" style="fill:#5a5a55"><title>vLLM-Omni · recommended HTTP, 4 loaders: P50 73.98 s, P90 124.11 s</title></path>
+<rect x="538.3" y="157" width="114.8" height="14" style="fill:#1a1a19"/>
+<text x="541.3" y="168.0" text-anchor="start" font-size="11.5" class="num">73.98 s  ·  10.3×</text>
+<text x="702.0" y="210.0" text-anchor="end" font-size="10.5" class="mut">seconds from the first handler instruction to first DiT entry · pooled P50 over 150 cold containers per configuration</text>
+<text x="252.0" y="236.0" text-anchor="end" font-size="11.5" font-weight="600" class="lbl">By region, P50 (s)</text>
+<text x="262.0" y="236.0" text-anchor="start" font-size="11" class="mut">ours</text>
+<text x="372.0" y="236.0" text-anchor="start" font-size="11" class="mut">fastest SGLang</text>
+<text x="502.0" y="236.0" text-anchor="start" font-size="11" class="mut">fastest vLLM-Omni</text>
+<text x="252.0" y="252.0" text-anchor="end" font-size="11" class="lbl">us-west</text>
+<text x="262.0" y="252.0" text-anchor="start" font-size="11" class="num">5.39</text>
+<text x="372.0" y="252.0" text-anchor="start" font-size="11" class="num">62.47</text>
+<text x="502.0" y="252.0" text-anchor="start" font-size="11" class="num">69.41</text>
+<text x="622.0" y="252.0" text-anchor="start" font-size="11" class="mut num">11.6× · 12.9×</text>
+<text x="252.0" y="268.0" text-anchor="end" font-size="11" class="lbl">ap-south</text>
+<text x="262.0" y="268.0" text-anchor="start" font-size="11" class="num">14.59</text>
+<text x="372.0" y="268.0" text-anchor="start" font-size="11" class="num">114.37</text>
+<text x="502.0" y="268.0" text-anchor="start" font-size="11" class="num">119.99</text>
+<text x="622.0" y="268.0" text-anchor="start" font-size="11" class="mut num">7.8× · 8.2×</text>
+<text x="252.0" y="284.0" text-anchor="end" font-size="11" class="lbl">eu-north</text>
+<text x="262.0" y="284.0" text-anchor="start" font-size="11" class="num">6.80</text>
+<text x="372.0" y="284.0" text-anchor="start" font-size="11" class="num">63.27</text>
+<text x="502.0" y="284.0" text-anchor="start" font-size="11" class="num">70.38</text>
+<text x="622.0" y="284.0" text-anchor="start" font-size="11" class="mut num">9.3× · 10.3×</text>
+</svg>

@@ -54,6 +54,15 @@ weights keep their own terms.
   construction from version `0.6.15.post1` (`flashinfer/cute_dsl/sparse/blk64/flash_fwd_launch_template.h`).
   Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved. [Apache-2.0](APACHE-2.0-LICENSE).
   Upstream attention kernels and CUTLASS remain external build dependencies.
+- **SGLang:** MiniMax H3's numerics follow SGLang commit `ad7a9b53ccad9d53599cb872233e2cedee1fe154`.
+  Copyright 2023-2024 SGLang Team, [Apache-2.0](APACHE-2.0-LICENSE).
+  `models/minimax_h3_official/kernels/transformer/qk_rope_opt.cu` adapts the warp reduction of
+  `impl/norm.cuh` (`apply_norm_warp`) and the BF16 `rotary_add`/`rotary_sub` expressions of its fused
+  QK norm and RoPE. Noise streams, packed-QKV views, Qwen vision position interpolation, SubBlock
+  query-block indices and pixel conversion follow its H3 pipeline. The SubBlock router kernels
+  (`python/sglang/multimodal_gen/runtime/layers/attention/backends/subblock_sparse/kernels.py`) are
+  fetched unmodified at that commit, checked by SHA-256 and compiled ahead of time during preparation;
+  they are not distributed here.
 - **cuDNN frontend:** headers at commit `c4a97621eca52fa0c3a1862a411a16be580b25c6` keep their
   [NVIDIA MIT license](CUDNN-FRONTEND-LICENSE). CUDA, cuBLAS, cuDNN and NCCL are separately distributed.
 - **JSON:** nlohmann/json keeps Niels Lohmann's [MIT copyright and license](NLOHMANN-JSON-LICENSE).

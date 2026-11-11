@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="182" viewBox="0 0 760 182" font-family="system-ui, -apple-system, &quot;Segoe UI&quot;, Helvetica, Arial, sans-serif" role="img" aria-label="Startup timelines of one real container near the median per configuration. SGLang Diffusion spends 31 seconds and vLLM-Omni 20 seconds before reading a weight, then load their components one after another and enter the first DiT forward at 65.5 and 73.9 seconds. The native container loads Qwen, the DiT and the video encoder in parallel, finishes its preloads at 7.1 seconds and enters the first DiT forward at 7.2 seconds."><style>text{fill:#c3c2b7}.lbl{fill:#f0efec}.mut{fill:#898781}.num{font-variant-numeric:tabular-nums}</style><rect width="100%" height="100%" rx="6" fill="#1a1a19"/>
+<rect x="140" y="8" width="12" height="12" rx="2" style="fill:#5a5a55"/><text x="158.0" y="18.0" text-anchor="start" font-size="12.5">imports, service and device bootstrap</text>
+<rect x="384" y="8" width="12" height="12" rx="2" style="fill:#3987e5"/><text x="402.0" y="18.0" text-anchor="start" font-size="12.5">model component loads</text>
+<rect x="548" y="8" width="12" height="12" rx="2" style="fill:#d95926"/><text x="566.0" y="18.0" text-anchor="start" font-size="12.5">after loading, to first DiT</text>
+<line x1="196.0" y1="38" x2="196.0" y2="142" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="196.0" y="157.0" text-anchor="middle" font-size="11" class="mut num">0</text>
+<line x1="332.0" y1="38" x2="332.0" y2="142" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="332.0" y="157.0" text-anchor="middle" font-size="11" class="mut num">20 s</text>
+<line x1="468.0" y1="38" x2="468.0" y2="142" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="468.0" y="157.0" text-anchor="middle" font-size="11" class="mut num">40 s</text>
+<line x1="604.0" y1="38" x2="604.0" y2="142" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="604.0" y="157.0" text-anchor="middle" font-size="11" class="mut num">60 s</text>
+<line x1="740.0" y1="38" x2="740.0" y2="142" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="740.0" y="157.0" text-anchor="middle" font-size="11" class="mut num">80 s</text>
+<line x1="196" y1="38" x2="196" y2="142" style="stroke:#383835" stroke-width="1"/>
+<text x="740.0" y="172.0" text-anchor="end" font-size="11" class="mut">seconds from the first handler instruction · one real container nearest each configuration&#x27;s pooled median</text>
+<text x="184.0" y="60.5" text-anchor="end" font-size="12.5" font-weight="600" class="lbl">Ours</text>
+<rect x="196.0" y="46" width="2.4" height="20" rx="2" style="fill:#5a5a55"><title>Ours: controller 0.0–0.5 s</title></rect>
+<rect x="199.4" y="46" width="43.6" height="20" rx="2" style="fill:#3987e5"><title>Ours: parallel preloads 0.5–7.1 s</title></rect>
+<rect x="244.0" y="46" width="0.8" height="20" rx="2" style="fill:#d95926"><title>Ours: after load 7.1–7.2 s</title></rect>
+<text x="250.9" y="60.0" text-anchor="start" font-size="11" font-weight="600" class="lbl">first DiT 7.2 s</text>
+<text x="184.0" y="94.5" text-anchor="end" font-size="12.5" font-weight="600" class="lbl">SGLang · recommended</text>
+<rect x="196.0" y="80" width="210.4" height="20" rx="2" style="fill:#5a5a55"><title>SGLang · recommended: bootstrap 0.0–31.1 s</title></rect>
+<text x="301.2" y="93.8" text-anchor="middle" font-size="10" style="fill:#ffffff">bootstrap 31 s</text>
+<rect x="407.4" y="80" width="77.9" height="20" rx="2" style="fill:#3987e5"><title>SGLang · recommended: Qwen 31.1–42.7 s</title></rect>
+<text x="446.3" y="93.8" text-anchor="middle" font-size="10" style="fill:#ffffff">Qwen 12 s</text>
+<rect x="486.3" y="80" width="52.8" height="20" rx="2" style="fill:#3987e5"><title>SGLang · recommended: DiT 42.7–50.6 s</title></rect>
+<rect x="540.1" y="80" width="25.4" height="20" rx="2" style="fill:#3987e5"><title>SGLang · recommended: VAEs 50.6–54.5 s</title></rect>
+<rect x="566.5" y="80" width="73.9" height="20" rx="2" style="fill:#d95926"><title>SGLang · recommended: after load 54.5–65.5 s</title></rect>
+<text x="603.5" y="93.8" text-anchor="middle" font-size="10" style="fill:#ffffff">after load 11 s</text>
+<text x="641.5" y="76.0" text-anchor="end" font-size="11" font-weight="600" class="lbl">first DiT 65.5 s</text>
+<text x="184.0" y="128.5" text-anchor="end" font-size="12.5" font-weight="600" class="lbl">vLLM-Omni · recommended</text>
+<rect x="196.0" y="114" width="132.0" height="20" rx="2" style="fill:#5a5a55"><title>vLLM-Omni · recommended: bootstrap 0.0–19.6 s</title></rect>
+<text x="262.0" y="127.8" text-anchor="middle" font-size="10" style="fill:#ffffff">bootstrap 20 s</text>
+<rect x="329.0" y="114" width="140.2" height="20" rx="2" style="fill:#3987e5"><title>vLLM-Omni · recommended: pipeline + VAE 19.6–40.3 s</title></rect>
+<text x="399.2" y="127.8" text-anchor="middle" font-size="10" style="fill:#ffffff">pipeline + VAE 21 s</text>
+<rect x="470.3" y="114" width="3.8" height="20" rx="2" style="fill:#2c2c2a"><title>vLLM-Omni · recommended: gap 40.3–41.0 s</title></rect>
+<rect x="475.1" y="114" width="117.0" height="20" rx="2" style="fill:#3987e5"><title>vLLM-Omni · recommended: DiT weights 41.0–58.4 s</title></rect>
+<text x="533.6" y="127.8" text-anchor="middle" font-size="10" style="fill:#ffffff">DiT weights 17 s</text>
+<rect x="593.3" y="114" width="69.9" height="20" rx="2" style="fill:#3987e5"><title>vLLM-Omni · recommended: Qwen 58.4–68.8 s</title></rect>
+<text x="628.2" y="127.8" text-anchor="middle" font-size="10" style="fill:#ffffff">Qwen 10 s</text>
+<rect x="664.2" y="114" width="33.6" height="20" rx="2" style="fill:#d95926"><title>vLLM-Omni · recommended: after load 68.8–73.9 s</title></rect>
+<text x="698.8" y="110.0" text-anchor="end" font-size="11" font-weight="600" class="lbl">first DiT 73.9 s</text>
+</svg>

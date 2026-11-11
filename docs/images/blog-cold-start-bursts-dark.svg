@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="270" viewBox="0 0 760 270" font-family="system-ui, -apple-system, &quot;Segoe UI&quot;, Helvetica, Arial, sans-serif" role="img" aria-label="How fast 711 request bursts in a week of our busy hours rose: 97% climbed from the hour's average request rate to twice it within a minute; peaks in multiples of the average: 2–3× 57%, 3–4× 24%, 4–5× 11%, 5×+ 8%."><style>text{fill:#c3c2b7}.lbl{fill:#f0efec}.mut{fill:#898781}.num{font-variant-numeric:tabular-nums}</style><rect width="100%" height="100%" rx="6" fill="#1a1a19"/>
+<text x="60.0" y="22.0" text-anchor="start" font-size="12.5" font-weight="600" class="lbl">Up: average to twice it</text>
+<text x="60.0" y="40.0" text-anchor="start" font-size="12" font-weight="600" class="lbl">97% within a minute</text>
+<line x1="60" y1="228.0" x2="440" y2="228.0" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="52.0" y="232.0" text-anchor="end" font-size="11" class="mut num">0%</text>
+<line x1="60" y1="187.0" x2="440" y2="187.0" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="52.0" y="191.0" text-anchor="end" font-size="11" class="mut num">20%</text>
+<line x1="60" y1="146.0" x2="440" y2="146.0" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="52.0" y="150.0" text-anchor="end" font-size="11" class="mut num">40%</text>
+<line x1="60" y1="105.0" x2="440" y2="105.0" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="52.0" y="109.0" text-anchor="end" font-size="11" class="mut num">60%</text>
+<line x1="60" y1="64.0" x2="440" y2="64.0" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="52.0" y="68.0" text-anchor="end" font-size="11" class="mut num">80%</text>
+<rect x="61.0" y="81.2" width="17.0" height="146.8" rx="1.2" style="fill:#3987e5;stroke:#3987e5" stroke-width="0"/>
+<rect x="80.0" y="175.2" width="17.0" height="52.8" rx="1.2" style="fill:#3987e5;stroke:#3987e5" stroke-width="0"/>
+<rect x="99.0" y="223.7" width="17.0" height="4.3" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="118.0" y="227.1" width="17.0" height="0.9" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="137.0" y="227.7" width="17.0" height="0.3" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="156.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="175.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="194.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="213.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="232.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="251.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="270.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="289.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="308.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="327.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="346.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="365.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="384.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="403.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<rect x="422.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:#2c2c2a;stroke:#3987e5" stroke-width="1"/>
+<text x="60.0" y="244.0" text-anchor="middle" font-size="11" class="mut">0 min</text>
+<text x="250.0" y="244.0" text-anchor="middle" font-size="11" class="mut">5 min</text>
+<text x="440.0" y="244.0" text-anchor="end" font-size="11" class="mut">10 min</text>
+<text x="440.0" y="264.0" text-anchor="end" font-size="10.5" class="mut">share of the 711 bursts in a week of busy hours, in 30-second bins</text>
+<line x1="480" y1="12" x2="480" y2="250" style="stroke:#2c2c2a" stroke-width="1"/>
+<text x="520.0" y="22.0" text-anchor="start" font-size="12.5" font-weight="600" class="lbl">How high each burst peaks</text>
+<text x="520.0" y="40.0" text-anchor="start" font-size="11" class="mut">in multiples of the hour&#x27;s average</text>
+<line x1="520" y1="228.0" x2="740" y2="228.0" style="stroke:#2c2c2a" stroke-width="1"/>
+<line x1="520" y1="187.0" x2="740" y2="187.0" style="stroke:#2c2c2a" stroke-width="1"/>
+<line x1="520" y1="146.0" x2="740" y2="146.0" style="stroke:#2c2c2a" stroke-width="1"/>
+<line x1="520" y1="105.0" x2="740" y2="105.0" style="stroke:#2c2c2a" stroke-width="1"/>
+<line x1="520" y1="64.0" x2="740" y2="64.0" style="stroke:#2c2c2a" stroke-width="1"/>
+<rect x="526.0" y="111.8" width="43.0" height="116.2" rx="1.5" style="fill:#3987e5"/>
+<text x="547.5" y="105.8" text-anchor="middle" font-size="12" font-weight="600" class="lbl">57%</text>
+<text x="547.5" y="244.0" text-anchor="middle" font-size="11" class="mut">2–3×</text>
+<rect x="581.0" y="177.8" width="43.0" height="50.2" rx="1.5" style="fill:#3987e5"/>
+<text x="602.5" y="171.8" text-anchor="middle" font-size="12" font-weight="600" class="lbl">24%</text>
+<text x="602.5" y="244.0" text-anchor="middle" font-size="11" class="mut">3–4×</text>
+<rect x="636.0" y="204.9" width="43.0" height="23.1" rx="1.5" style="fill:#3987e5"/>
+<text x="657.5" y="198.9" text-anchor="middle" font-size="12" font-weight="600" class="lbl">11%</text>
+<text x="657.5" y="244.0" text-anchor="middle" font-size="11" class="mut">4–5×</text>
+<rect x="691.0" y="212.4" width="43.0" height="15.6" rx="1.5" style="fill:#3987e5"/>
+<text x="712.5" y="206.4" text-anchor="middle" font-size="12" font-weight="600" class="lbl">8%</text>
+<text x="712.5" y="244.0" text-anchor="middle" font-size="11" class="mut">5×+</text>
+</svg>
