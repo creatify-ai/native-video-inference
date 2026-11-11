@@ -29,6 +29,24 @@ Coming from PyTorch, SGLang or vLLM? The [FAQ](docs/faq.md) ([中文](docs/faq.z
 the design decisions behind it, compares its speed and cold start with SGLang and vLLM-Omni, and maps
 those frameworks' concepts to this repository.
 
+## LLMs: DeepSeek-V4
+
+The same approach also serves a large LLM. This is outside the repository's focus (video
+generation), but it shows that a model of this size can start in seconds instead of minutes
+without changing one output bit. The Flash port is ready on correctness and performance; the Pro
+port is correct but has had no performance tuning. Both ports replay SGLang's own kernels on
+NVIDIA B300 and read a prepared package of weights.
+
+| Model | Hardware | Outputs | Throughput | Cold start: SGLang → native |
+| --- | --- | --- | --- | --- |
+| [DeepSeek-V4-Flash](models/deepseek_v4_flash/README.md) (NVFP4, 284 B parameters, 165 GB) | one B300 | equal to SGLang's bit for bit | matches SGLang within 0–4% (16k–131k contexts, 32–256 concurrent requests, MTP) | 9–27 min → **7–9 s** |
+| [DeepSeek-V4-Pro](models/deepseek_v4_pro/README.md) (NVFP4, 928.5 GB) | eight B300s (`--tp 8`) | first token and logits equal to SGLang's bit for bit | not worked on: cold start and correctness only | 19.8 min → **26.5 s** |
+
+SGLang's figure is its stock server from launch to ready; the native one is from process start to
+the first token on a host that has read the package, without the container start. Modal caches
+Volume data per host, not per region: on a host that has not read the package Flash takes
+16–142 s and Pro 212 s. Each model's README gives the method, the measurements and the limits.
+
 ## Cold start
 
 Cold start of each example's default request, measured with `--cold-start` on fresh
@@ -258,7 +276,7 @@ flowchart LR
 - [Architecture](docs/architecture.md), [fast cold start](docs/fast-cold-start.md),
   [porting a model](docs/porting-a-model.md) and [building from source](docs/build.md) document
   the protocol; the [FAQ](docs/faq.md) answers common questions. The
-  [cold-start post](docs/blog-cold-start.md) explains why startup matters for video
+  [cold-start post](docs/blog-cold-start.md) ([HTML](docs/blog-cold-start.html)) explains why startup matters for video
   serving, and the [SGLang proposal](docs/sglang-cold-start-proposal.md) brings the same ideas to
   SGLang Diffusion.
 

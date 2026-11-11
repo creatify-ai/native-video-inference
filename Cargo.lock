@@ -237,6 +237,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsv4-flash-native"
+version = "0.1.0"
+dependencies = [
+ "native-core-infra",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokenizers",
+]
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

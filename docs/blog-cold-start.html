@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How We Made Video Model Cold Starts 10× Faster and Halved GPU Time</title>
+<meta name="description" content="Seven seconds to the first denoising step on a fresh B200, against 65 to 75 for SGLang Diffusion and vLLM-Omni. On our production traffic, that cuts idle GPU time by 84%.">
+<style>
+:root{color-scheme:light;--page:#ffffff;--surface:#fcfcfb;--ink:#0b0b0b;--ink-2:#52514e;--muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;--border:rgba(11,11,11,.10);--ctx:#b8b7b0;--s1:#2a78d6;--s2:#eb6834;--s1-wash:rgba(42,120,214,.16);--note-bg:#fbf6e9;--note-border:#d9b95a}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--ink:#f0efec;--ink-2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--ctx:#5a5a55;--s1:#3987e5;--s2:#d95926;--s1-wash:rgba(57,135,229,.26);--note-bg:#2a2616;--note-border:#7a6a2e}}
+:root[data-theme="dark"]{color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--ink:#f0efec;--ink-2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--ctx:#5a5a55;--s1:#3987e5;--s2:#d95926;--s1-wash:rgba(57,135,229,.26);--note-bg:#2a2616;--note-border:#7a6a2e}
+*{box-sizing:border-box}
+html{background:var(--page)}
+body{margin:0;padding:56px 16px 72px;color:var(--ink);background:var(--page);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;font-size:17px;line-height:1.6;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+main{max-width:720px;margin:0 auto}
+h1{font-size:34px;line-height:1.15;letter-spacing:-.012em;margin:0 0 10px;font-weight:700}
+.subtitle{font-size:20px;line-height:1.35;color:var(--ink-2);margin:0 0 16px;font-weight:400}
+.meta{font-size:14px;color:var(--muted);margin:0 0 40px;padding-bottom:20px;border-bottom:1px solid var(--grid)}
+h2{font-size:23px;line-height:1.25;margin:46px 0 12px;font-weight:600;letter-spacing:-.006em}
+h3{font-size:17px;margin:24px 0 8px;font-weight:600}
+p{margin:0 0 18px}
+ul{padding-left:22px;margin:0 0 18px}
+li{margin-bottom:8px}
+strong{font-weight:600}
+table{border-collapse:collapse;width:100%;margin:20px 0 26px;font-size:15px;line-height:1.45}
+th,td{text-align:left;vertical-align:top;padding:9px 12px 9px 0;border-bottom:1px solid var(--grid)}
+th{font-weight:600;color:var(--ink-2);font-size:12.5px;text-transform:uppercase;letter-spacing:.04em}
+th.num,td.num{text-align:right;font-variant-numeric:tabular-nums;padding-right:0;padding-left:12px}
+figure{margin:28px 0 34px;padding:20px 18px 16px;background:var(--surface);border:1px solid var(--border);border-radius:8px}
+figure svg{display:block;width:100%;height:auto;color:var(--ink)}
+figcaption{margin-top:12px;font-size:14px;line-height:1.5;color:var(--ink-2)}
+figcaption .fn{display:block;margin-top:6px;font-size:12.5px;color:var(--muted)}
+.keyresults{margin:6px 0 34px}
+.keyresults table{font-size:14px}
+.keyresults td.group{font-weight:600;color:var(--ink);white-space:nowrap;vertical-align:top}
+.keyresults th.value,.keyresults td.value{white-space:nowrap;padding-right:16px;color:var(--ink)}
+.keyresults th,.keyresults td{padding-right:14px}
+.keyresults td.status{color:var(--muted);font-size:13px}
+.keyresults .tablenote{font-size:12.5px;color:var(--muted);margin:8px 0 0}
+table.contract{font-size:13.5px}
+table.contract td:first-child{white-space:nowrap;vertical-align:top}
+@media print{.keyresults table{font-size:8.5pt}table.contract{font-size:8pt}}
+.figtable{margin:-14px 0 30px;padding:0 18px}
+.figtable .tablenote{font-size:12.5px;color:var(--muted);margin:0}
+.figtable table{font-size:13px;margin:6px 0 0}
+.figtable th,.figtable td{padding:6px 10px 6px 0}
+svg text{font-family:inherit;fill:var(--ink-2)}
+svg .lbl{fill:var(--ink)}
+svg .mut{fill:var(--muted)}
+svg .num{font-variant-numeric:tabular-nums}
+sup.fnref{font-size:.7em;line-height:0;vertical-align:super}
+sup.fnref a{color:var(--s1);text-decoration:none}
+.notes-h{font-size:15px;margin-top:40px;padding-top:14px;border-top:1px solid var(--grid);color:var(--ink-2)}
+.footnote{font-size:14px;color:var(--ink-2);margin:0 0 10px}
+.footnote .fnnum{display:inline-block;min-width:1.2em;color:var(--muted)}
+.footnote a{color:var(--s1)}
+.fnback{text-decoration:none;margin-left:4px}
+@media print{.fnback{display:none}}
+.editorial{margin-top:56px;padding:18px 22px 8px;border:1px dashed var(--note-border);background:var(--note-bg);border-radius:8px;font-size:15px}
+.editorial h2{margin:0 0 12px;font-size:18px}
+.editorial p{margin-bottom:14px}
+@page{size:Letter;margin:17mm 17mm 19mm}
+@media print{
+  :root,:root:not([data-theme="light"]),:root[data-theme="dark"]{color-scheme:light;--page:#ffffff;--surface:#fcfcfb;--ink:#0b0b0b;--ink-2:#52514e;--muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;--border:rgba(11,11,11,.14);--ctx:#b8b7b0;--s1:#2a78d6;--s2:#eb6834;--s1-wash:rgba(42,120,214,.16);--note-bg:#fbf6e9;--note-border:#d9b95a}
+  body{padding:0;font-size:11pt;line-height:1.5}
+  main{max-width:none}
+  h1{font-size:24pt}.subtitle{font-size:14pt}.meta{margin-bottom:22pt}
+  h2{font-size:15pt;margin-top:22pt;break-after:avoid}
+  p,li{orphans:3;widows:3}
+  figure,table,.editorial,.figtable,.keep{break-inside:avoid}
+  figure{padding:8pt 10pt 6pt;margin:10pt 0 12pt}
+  figcaption{margin-top:6pt}
+  .figtable{margin:-4pt 0 10pt}
+  .figtable table{font-size:8.5pt}
+  figcaption{font-size:9.5pt}figcaption .fn{font-size:8.5pt}
+  figure table{font-size:8.5pt}
+}
+
+.strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:0 0 8px}
+.tile{border:1px solid var(--border);border-radius:8px;background:var(--surface);padding:14px 16px 12px}
+.tile .big{font-size:26px;font-weight:700;line-height:1.15;letter-spacing:-.01em;font-variant-numeric:tabular-nums;color:var(--ink)}
+.tile:first-child .big{color:var(--s1)}
+.tile .what{font-size:14px;font-weight:600;margin:6px 0 4px}
+.tile .detail{font-size:12.5px;line-height:1.4;color:var(--muted)}
+p.tablenote{font-size:12.5px;color:var(--muted);margin:-14px 0 22px}
+@media print{.tile .big{font-size:18pt}.strip{break-inside:avoid}}
+</style>
+</head>
+<body>
+<main>
+<h1>How We Made Video Model Cold Starts 10× Faster and Halved GPU Time</h1>
+<p class="subtitle">Seven seconds to the first denoising step on a fresh B200, against 65 to 75 for SGLang Diffusion and vLLM-Omni. On our production traffic, that cuts idle GPU time by 84%.</p>
+<div class="strip">
+<div class="tile"><div class="big">≈10×</div><div class="what">faster cold start</div><div class="detail">7.21 s to the first denoising step, against 64.70 s for SGLang Diffusion and 71.50 s for vLLM-Omni; median of 150 cold B200 containers each</div></div>
+<div class="tile"><div class="big">84%</div><div class="what">less idle GPU time</div><div class="detail">time spent starting up or kept idle, replaying our production traffic with a 70-second and a 7.2-second startup; the same work needs 44% of the GPU time</div></div>
+</div>
+<figure id="fig-startup"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" role="img" aria-label="Cold-start study on one B200, ten configurations, three regions pooled: the native runtime reaches the first denoising step at a median of 7.21 seconds; the 4 SGLang Diffusion and vLLM-Omni configurations shown take 64.70 to 73.98 seconds. By region the native median is 5.39, 14.59 and 6.80 seconds.">
+<rect x="262" y="12" width="12" height="12" rx="2" style="fill:var(--s1)"/><text x="280.0" y="22.0" text-anchor="start" font-size="12.5">Ours</text>
+<rect x="342" y="12" width="12" height="12" rx="2" style="fill:var(--s2)"/><text x="360.0" y="22.0" text-anchor="start" font-size="12.5">SGLang Diffusion</text>
+<rect x="488" y="12" width="12" height="12" rx="2" style="fill:var(--ctx)"/><text x="506.0" y="22.0" text-anchor="start" font-size="12.5">vLLM-Omni</text>
+<line x1="262.0" y1="50" x2="262.0" y2="178" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="262.0" y="194.0" text-anchor="middle" font-size="11" class="mut num">0</text>
+<line x1="372.0" y1="50" x2="372.0" y2="178" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="372.0" y="194.0" text-anchor="middle" font-size="11" class="mut num">30 s</text>
+<line x1="482.0" y1="50" x2="482.0" y2="178" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="482.0" y="194.0" text-anchor="middle" font-size="11" class="mut num">60 s</text>
+<line x1="592.0" y1="50" x2="592.0" y2="178" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="592.0" y="194.0" text-anchor="middle" font-size="11" class="mut num">90 s</text>
+<line x1="702.0" y1="50" x2="702.0" y2="178" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="702.0" y="194.0" text-anchor="middle" font-size="11" class="mut num">120 s</text>
+<line x1="262" y1="50" x2="262" y2="178" style="stroke:var(--axis)" stroke-width="1"/>
+<text x="252.0" y="72.0" text-anchor="end" font-size="11.5" font-weight="600" class="lbl">Ours</text>
+<path d="M262.0,60.0 h22.4 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-22.4 z" style="fill:var(--s1)"><title>Ours: P50 7.21 s, P90 19.88 s</title></path>
+<rect x="293.4" y="61" width="44.4" height="14" style="fill:var(--surface)"/>
+<text x="296.4" y="72.0" text-anchor="start" font-size="11.5" class="num">7.21 s</text>
+<text x="252.0" y="96.0" text-anchor="end" font-size="11.5" class="lbl">SGLang · short startup, direct GPU loading</text>
+<path d="M262.0,84.0 h233.2 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-233.2 z" style="fill:var(--s2)"><title>SGLang · short startup, direct GPU loading: P50 64.70 s, P90 119.31 s</title></path>
+<rect x="504.2" y="85" width="108.4" height="14" style="fill:var(--surface)"/>
+<text x="507.2" y="96.0" text-anchor="start" font-size="11.5" class="num">64.70 s  ·  9.0×</text>
+<text x="252.0" y="120.0" text-anchor="end" font-size="11.5" class="lbl">SGLang · recommended configuration</text>
+<path d="M262.0,108.0 h235.8 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-235.8 z" style="fill:var(--s2)"><title>SGLang · recommended configuration: P50 65.40 s, P90 121.16 s</title></path>
+<rect x="506.8" y="109" width="108.4" height="14" style="fill:var(--surface)"/>
+<text x="509.8" y="120.0" text-anchor="start" font-size="11.5" class="num">65.40 s  ·  9.1×</text>
+<text x="252.0" y="144.0" text-anchor="end" font-size="11.5" class="lbl">vLLM-Omni · offline default</text>
+<path d="M262.0,132.0 h258.2 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-258.2 z" style="fill:var(--ctx)"><title>vLLM-Omni · offline default: P50 71.50 s, P90 126.03 s</title></path>
+<rect x="529.2" y="133" width="108.4" height="14" style="fill:var(--surface)"/>
+<text x="532.2" y="144.0" text-anchor="start" font-size="11.5" class="num">71.50 s  ·  9.9×</text>
+<text x="252.0" y="168.0" text-anchor="end" font-size="11.5" class="lbl">vLLM-Omni · recommended HTTP, 4 loaders</text>
+<path d="M262.0,156.0 h267.3 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-267.3 z" style="fill:var(--ctx)"><title>vLLM-Omni · recommended HTTP, 4 loaders: P50 73.98 s, P90 124.11 s</title></path>
+<rect x="538.3" y="157" width="114.8" height="14" style="fill:var(--surface)"/>
+<text x="541.3" y="168.0" text-anchor="start" font-size="11.5" class="num">73.98 s  ·  10.3×</text>
+<text x="702.0" y="210.0" text-anchor="end" font-size="10.5" class="mut">seconds from the first handler instruction to first DiT entry · pooled P50 over 150 cold containers per configuration</text>
+<text x="252.0" y="236.0" text-anchor="end" font-size="11.5" font-weight="600" class="lbl">By region, P50 (s)</text>
+<text x="262.0" y="236.0" text-anchor="start" font-size="11" class="mut">ours</text>
+<text x="372.0" y="236.0" text-anchor="start" font-size="11" class="mut">fastest SGLang</text>
+<text x="502.0" y="236.0" text-anchor="start" font-size="11" class="mut">fastest vLLM-Omni</text>
+<text x="252.0" y="252.0" text-anchor="end" font-size="11" class="lbl">us-west</text>
+<text x="262.0" y="252.0" text-anchor="start" font-size="11" class="num">5.39</text>
+<text x="372.0" y="252.0" text-anchor="start" font-size="11" class="num">62.47</text>
+<text x="502.0" y="252.0" text-anchor="start" font-size="11" class="num">69.41</text>
+<text x="622.0" y="252.0" text-anchor="start" font-size="11" class="mut num">11.6× · 12.9×</text>
+<text x="252.0" y="268.0" text-anchor="end" font-size="11" class="lbl">ap-south</text>
+<text x="262.0" y="268.0" text-anchor="start" font-size="11" class="num">14.59</text>
+<text x="372.0" y="268.0" text-anchor="start" font-size="11" class="num">114.37</text>
+<text x="502.0" y="268.0" text-anchor="start" font-size="11" class="num">119.99</text>
+<text x="622.0" y="268.0" text-anchor="start" font-size="11" class="mut num">7.8× · 8.2×</text>
+<text x="252.0" y="284.0" text-anchor="end" font-size="11" class="lbl">eu-north</text>
+<text x="262.0" y="284.0" text-anchor="start" font-size="11" class="num">6.80</text>
+<text x="372.0" y="284.0" text-anchor="start" font-size="11" class="num">63.27</text>
+<text x="502.0" y="284.0" text-anchor="start" font-size="11" class="num">70.38</text>
+<text x="622.0" y="284.0" text-anchor="start" font-size="11" class="mut num">9.3× · 10.3×</text>
+</svg><figcaption><strong>Figure 1. A cold container reaches its first denoising step in 7.2 seconds; SGLang Diffusion and vLLM-Omni take 65 to 74.</strong> Median over 150 cold containers per configuration on one B200, 50 in each of three Modal regions; ratios are to our median, and the lower rows give each region&#x27;s median. For each engine, its fastest configuration and its recommended one; the other five (72.14 to 75.00 s) are in Appendix A, with what each configuration name means, the workload, the clock and the P90s.</figcaption></figure>
+<p>A video model's cold start decides two things: how long the first user in a burst waits, and how much GPU time you pay for that produces nothing. We rebuilt our video inference framework in Rust, and on it a fresh MiniMax H3 container reaches its first denoising step at a median of 7.21 seconds on one B200, and in about the same time on two. With the same workload on one B200, the fastest SGLang Diffusion and vLLM-Omni configurations we tested take 64.70 and 71.50 seconds, 9.0× and 9.9× as long, across 1,500 cold containers in three regions.<sup class="fnref" id="fnref-1"><a href="#fn-1">1</a></sup> This post explains why that matters, where the minute goes, and what we changed. The source is at <a href="https://github.com/creatify-ai/native-video-inference">github.com/creatify-ai/native-video-inference</a>, under a source-available community license.</p>
+<h2>Why startup time matters</h2>
+<h3>A video request holds a whole GPU for a minute</h3>
+<p>LLM serving assumes that a burst becomes a bigger batch. The assumption holds because decoding is memory-bound: each step reads the weights once for the whole batch, so another sequence costs little, and the compute left idle is where new prompts get processed. The machinery is built around this: continuous batching admits new requests into a running batch, chunked prefill slices long prompts into that spare compute alongside ongoing decodes, and a paged KV cache fits more sequences into the same memory. A hundred GPUs serving an LLM handle thousands of conversations at once, and when a burst arrives, every reply slows a little. The extra wait is usually seconds, far shorter than a new server takes to start, so startup is paid once and amortized, and cold start has been a lower priority.</p>
+<p>Video generation has no such slack. A diffusion request behaves like one enormous prefill, redone at every denoising step: compute-bound almost from start to finish, with no idle phase for another request to ride along in. It holds at least a whole GPU for a minute or more, and batching several gains little. A hundred GPUs generate at most a hundred videos; the hundred-and-first waits up to a full generation for a GPU to free up, or for a new one to start. When the alternative to a cold start is a minute in the queue, how fast a GPU comes up decides how long users wait.</p>
+<p>Video generation bursts are common: as fal puts it, a feature launch or a viral template can multiply demand within minutes.<sup class="fnref" id="fnref-2"><a href="#fn-2">2</a></sup> Our own traffic looks the same. Over a week of busy hours, the per-minute request rate crossed twice the hourly average about nine times an hour, typically peaking near three times it, and nearly one burst in five reached four times. At the extreme, the busiest minute of that week brought more than twenty times the requests of a typical minute. Figure 2 shows how fast those bursts rose, and how high they peaked.</p>
+<figure id="fig-bursts"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 270" role="img" aria-label="How fast 711 request bursts in a week of our busy hours rose: 97% climbed from the hour's average request rate to twice it within a minute; peaks in multiples of the average: 2–3× 57%, 3–4× 24%, 4–5× 11%, 5×+ 8%.">
+<text x="60.0" y="22.0" text-anchor="start" font-size="12.5" font-weight="600" class="lbl">Up: average to twice it</text>
+<text x="60.0" y="40.0" text-anchor="start" font-size="12" font-weight="600" class="lbl">97% within a minute</text>
+<line x1="60" y1="228.0" x2="440" y2="228.0" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="52.0" y="232.0" text-anchor="end" font-size="11" class="mut num">0%</text>
+<line x1="60" y1="187.0" x2="440" y2="187.0" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="52.0" y="191.0" text-anchor="end" font-size="11" class="mut num">20%</text>
+<line x1="60" y1="146.0" x2="440" y2="146.0" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="52.0" y="150.0" text-anchor="end" font-size="11" class="mut num">40%</text>
+<line x1="60" y1="105.0" x2="440" y2="105.0" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="52.0" y="109.0" text-anchor="end" font-size="11" class="mut num">60%</text>
+<line x1="60" y1="64.0" x2="440" y2="64.0" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="52.0" y="68.0" text-anchor="end" font-size="11" class="mut num">80%</text>
+<rect x="61.0" y="81.2" width="17.0" height="146.8" rx="1.2" style="fill:var(--s1);stroke:var(--s1)" stroke-width="0"/>
+<rect x="80.0" y="175.2" width="17.0" height="52.8" rx="1.2" style="fill:var(--s1);stroke:var(--s1)" stroke-width="0"/>
+<rect x="99.0" y="223.7" width="17.0" height="4.3" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="118.0" y="227.1" width="17.0" height="0.9" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="137.0" y="227.7" width="17.0" height="0.3" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="156.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="175.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="194.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="213.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="232.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="251.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="270.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="289.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="308.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="327.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="346.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="365.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="384.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="403.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<rect x="422.0" y="228.0" width="17.0" height="0.0" rx="1.2" style="fill:var(--grid);stroke:var(--s1)" stroke-width="1"/>
+<text x="60.0" y="244.0" text-anchor="middle" font-size="11" class="mut">0 min</text>
+<text x="250.0" y="244.0" text-anchor="middle" font-size="11" class="mut">5 min</text>
+<text x="440.0" y="244.0" text-anchor="end" font-size="11" class="mut">10 min</text>
+<text x="440.0" y="264.0" text-anchor="end" font-size="10.5" class="mut">share of the 711 bursts in a week of busy hours, in 30-second bins</text>
+<line x1="480" y1="12" x2="480" y2="250" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="520.0" y="22.0" text-anchor="start" font-size="12.5" font-weight="600" class="lbl">How high each burst peaks</text>
+<text x="520.0" y="40.0" text-anchor="start" font-size="11" class="mut">in multiples of the hour&#x27;s average</text>
+<line x1="520" y1="228.0" x2="740" y2="228.0" style="stroke:var(--grid)" stroke-width="1"/>
+<line x1="520" y1="187.0" x2="740" y2="187.0" style="stroke:var(--grid)" stroke-width="1"/>
+<line x1="520" y1="146.0" x2="740" y2="146.0" style="stroke:var(--grid)" stroke-width="1"/>
+<line x1="520" y1="105.0" x2="740" y2="105.0" style="stroke:var(--grid)" stroke-width="1"/>
+<line x1="520" y1="64.0" x2="740" y2="64.0" style="stroke:var(--grid)" stroke-width="1"/>
+<rect x="526.0" y="111.8" width="43.0" height="116.2" rx="1.5" style="fill:var(--s1)"/>
+<text x="547.5" y="105.8" text-anchor="middle" font-size="12" font-weight="600" class="lbl">57%</text>
+<text x="547.5" y="244.0" text-anchor="middle" font-size="11" class="mut">2–3×</text>
+<rect x="581.0" y="177.8" width="43.0" height="50.2" rx="1.5" style="fill:var(--s1)"/>
+<text x="602.5" y="171.8" text-anchor="middle" font-size="12" font-weight="600" class="lbl">24%</text>
+<text x="602.5" y="244.0" text-anchor="middle" font-size="11" class="mut">3–4×</text>
+<rect x="636.0" y="204.9" width="43.0" height="23.1" rx="1.5" style="fill:var(--s1)"/>
+<text x="657.5" y="198.9" text-anchor="middle" font-size="12" font-weight="600" class="lbl">11%</text>
+<text x="657.5" y="244.0" text-anchor="middle" font-size="11" class="mut">4–5×</text>
+<rect x="691.0" y="212.4" width="43.0" height="15.6" rx="1.5" style="fill:var(--s1)"/>
+<text x="712.5" y="206.4" text-anchor="middle" font-size="12" font-weight="600" class="lbl">8%</text>
+<text x="712.5" y="244.0" text-anchor="middle" font-size="11" class="mut">5×+</text>
+</svg><figcaption><strong>Figure 2. Each request needs a whole GPU, so the GPUs needed rise and fall with requests. In a week of our busy hours, the request rate passed twice the hour&#x27;s average about nine times an hour, and 97% of those bursts got there within a minute.</strong> The request rate is the number of requests that arrived in the past minute, taken every second. A burst starts when it passes twice the hour&#x27;s average; up is the time since it was last at or below the average. On the right, how high each burst peaked, in multiples of the hour&#x27;s average (median 2.8×).</figcaption></figure>
+<h3>Waiting users or idle GPUs</h3>
+<p>A fixed number of GPUs cannot absorb these bursts. Size the fleet for the hour's average, and requests queue behind generations of a minute or more: once every GPU is busy, the next wave of requests waits up to 70 seconds, the wave after it up to 140, the one after that up to 210. Latency climbs with every wave in line, and a burst that lasts still needs more GPUs, so the cold start comes anyway, on top of the wait. Size the fleet for the peak, and the GPUs wait for requests instead: at three to four times the average, they sit idle most of the hour. Few companies will keep hundreds of B200s running around the clock for bursts that last minutes, and when a thousand requests arrive together, few have a thousand GPUs warmed up and waiting.</p>
+<p>The way out is to grow the fleet with the burst, but a slow startup brings both costs back. The first user in a burst waits through it, and the GPUs kept warm to avoid it sit idle. Figure 3 puts numbers on one cycle. Take a 70-second generation, roughly what a 28-step H3 request takes on two B200s.<sup class="fnref" id="fnref-3"><a href="#fn-3">3</a></sup> Because a restart is expensive, a worker is kept for a while after its last request; the rule of thumb we used ourselves keeps it idle for twice its startup time. With a 70-second startup, that is 140 seconds of idle, and of the 280 seconds the GPU is allocated, 25% is generation. Releasing the worker the moment the video finishes only lifts that to 50%. The first user also waits through the startup, so the first video takes 2.0× as long as a warm one. With a 7-second startup, the same cycle is 77% generation, 91% with no idle time at all, and the first video takes 1.10× as long.</p>
+<figure id="fig-cycle"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 238" role="img" aria-label="One request on one worker. With a 70 second startup, a 70 second generation and 140 seconds of idle retention, generation is 25% of the allocated time, 50% if the worker is released at once, and the first video takes 2.0× as long as a warm one. With a 7 second startup and 14 seconds of retention it is 77%, 91% and 1.10×.">
+<rect x="214" y="12" width="12" height="12" rx="2" style="fill:var(--s2)"/><text x="232.0" y="22.0" text-anchor="start" font-size="12.5">Startup</text>
+<rect x="302" y="12" width="12" height="12" rx="2" style="fill:var(--s1)"/><text x="320.0" y="22.0" text-anchor="start" font-size="12.5">Generation, 70 s</text>
+<rect x="444" y="12" width="12" height="12" rx="2" style="fill:var(--ctx)"/><text x="462.0" y="22.0" text-anchor="start" font-size="12.5">Idle before release, 2 × startup</text>
+<line x1="214.0" y1="48" x2="214.0" y2="206" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="214.0" y="221.0" text-anchor="middle" font-size="11" class="mut num">0</text>
+<line x1="318.4" y1="48" x2="318.4" y2="206" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="318.4" y="221.0" text-anchor="middle" font-size="11" class="mut num">60 s</text>
+<line x1="422.9" y1="48" x2="422.9" y2="206" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="422.9" y="221.0" text-anchor="middle" font-size="11" class="mut num">120 s</text>
+<line x1="527.3" y1="48" x2="527.3" y2="206" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="527.3" y="221.0" text-anchor="middle" font-size="11" class="mut num">180 s</text>
+<line x1="631.8" y1="48" x2="631.8" y2="206" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="631.8" y="221.0" text-anchor="middle" font-size="11" class="mut num">240 s</text>
+<line x1="214" y1="48" x2="214" y2="206" style="stroke:var(--axis)" stroke-width="1"/>
+<text x="684.0" y="237.0" text-anchor="end" font-size="10.5" class="mut">seconds of GPU time allocated to one request</text>
+<text x="202.0" y="68.0" text-anchor="end" font-size="12.5" font-weight="600" class="lbl">SGLang Diffusion / vLLM-Omni</text>
+<text x="202.0" y="83.0" text-anchor="end" font-size="11" class="mut">70 s startup</text>
+<path d="M214.0,58.0 h120.4 v24.0 h-120.4 z" style="fill:var(--s2)"><title>SGLang Diffusion / vLLM-Omni · startup: 70 s</title></path>
+<text x="274.9" y="74.0" text-anchor="middle" font-size="10.5" style="fill:#ffffff">startup 70 s</text>
+<path d="M335.9,58.0 h120.4 v24.0 h-120.4 z" style="fill:var(--s1)"><title>SGLang Diffusion / vLLM-Omni · generation: 70 s</title></path>
+<text x="396.8" y="74.0" text-anchor="middle" font-size="10.5" style="fill:#ffffff">generation 70 s</text>
+<path d="M457.7,58.0 h239.7 a4,4 0 0 1 4,4 v16.0 a4,4 0 0 1 -4,4 h-239.7 z" style="fill:var(--ctx)"><title>SGLang Diffusion / vLLM-Omni · idle: 140 s</title></path>
+<text x="579.6" y="74.0" text-anchor="middle" font-size="10.5" class="lbl">idle 140 s</text>
+<text x="709.4" y="74.5" text-anchor="start" font-size="11.5" class="num">280 s</text>
+<text x="214.0" y="99.0" text-anchor="start" font-size="11.5" class="lbl">25% generation  ·  50% if released at once  ·  first video takes 2.0× as long</text>
+<text x="202.0" y="144.0" text-anchor="end" font-size="12.5" font-weight="600" class="lbl">Ours</text>
+<text x="202.0" y="159.0" text-anchor="end" font-size="11" class="mut">7 s startup</text>
+<path d="M214.0,134.0 h10.7 v24.0 h-10.7 z" style="fill:var(--s2)"><title>Ours · startup: 7 s</title></path>
+<path d="M226.2,134.0 h120.4 v24.0 h-120.4 z" style="fill:var(--s1)"><title>Ours · generation: 70 s</title></path>
+<text x="287.1" y="150.0" text-anchor="middle" font-size="10.5" style="fill:#ffffff">generation 70 s</text>
+<path d="M348.0,134.0 h20.4 a4,4 0 0 1 4,4 v16.0 a4,4 0 0 1 -4,4 h-20.4 z" style="fill:var(--ctx)"><title>Ours · idle: 14 s</title></path>
+<text x="380.4" y="150.5" text-anchor="start" font-size="11.5" class="num">91 s</text>
+<text x="214.0" y="175.0" text-anchor="start" font-size="11.5" class="lbl">77% generation  ·  91% if released at once  ·  first video takes 1.10× as long</text>
+</svg><figcaption><strong>Figure 3. Startup, and the idle time it forces, decide how much of a GPU&#x27;s time is generation.</strong> One request on one worker: startup, a 70-second generation (note 3), then idle retention of twice the startup time before release. Platform scheduling excluded.</figcaption></figure>
+<p>One request per worker is the worst case; in real traffic a worker kept warm often catches the next request. Replaying our own production traffic with a 70-second and a 7.2-second startup, each kept idle for twice its startup, still moves the share of GPU time spent generating from 33% to 75%: the time GPUs spend starting up or sitting idle falls by 84%, and the same work needs 56% less GPU time.<sup class="fnref" id="fnref-4"><a href="#fn-4">4</a></sup></p>
+<p>For video generation, then, GPU efficiency also depends on how fast a fleet can follow demand: how quickly a new worker starts when a burst arrives, and how soon an idle one is released after it passes. The two are linked. A worker that takes a minute to start has to be kept for minutes after its last request, because releasing it early means paying that minute again on the next burst. A worker that starts in seconds can be released almost at once. Our principle is that a worker should be cheap enough to start that GPUs can follow demand instead of waiting for it.</p>
+<h2>Where the minute goes</h2>
+<p>In our cold-start study, ten configurations of the same MiniMax H3 workload each ran in 50 cold containers in each of three Modal regions, timed from the first instruction of our handler. The container is not the slow part: on Modal or fal, a new B200 container is running code within seconds.<sup class="fnref" id="fnref-5"><a href="#fn-5">5</a></sup> The nine SGLang Diffusion and vLLM-Omni configurations, the maintainers' recommended startup settings among them, reached the first denoising step at medians between 64.70 and 75.00 seconds, and close to two minutes at the 90th percentile. Both teams are actively improving startup and loading; these numbers are for the versions pinned in Appendix A.</p>
+<p>The hardware does not explain that minute. A PCIe Gen5 x16 link moves roughly 60 GB/s in each direction, so even the 66 GB of H3's DiT checkpoint crosses from host memory in about a second, less when it is split across two B200s. A Modal container reads 11 to 22 GB/s from its region's warm cache, so even the 133 GB of the DiT and text encoder checkpoints is a read of six to twelve seconds. Startup should take seconds. The rest of the minute is software.</p>
+<p>Figure 4 shows where it goes, in one real container near the median of ours and of each engine's recommended configuration.</p>
+<figure id="fig-breakdown"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 182" role="img" aria-label="Startup timelines of one real container near the median per configuration. SGLang Diffusion spends 31 seconds and vLLM-Omni 20 seconds before reading a weight, then load their components one after another and enter the first DiT forward at 65.5 and 73.9 seconds. The native container loads Qwen, the DiT and the video encoder in parallel, finishes its preloads at 7.1 seconds and enters the first DiT forward at 7.2 seconds.">
+<rect x="140" y="8" width="12" height="12" rx="2" style="fill:var(--ctx)"/><text x="158.0" y="18.0" text-anchor="start" font-size="12.5">imports, service and device bootstrap</text>
+<rect x="384" y="8" width="12" height="12" rx="2" style="fill:var(--s1)"/><text x="402.0" y="18.0" text-anchor="start" font-size="12.5">model component loads</text>
+<rect x="548" y="8" width="12" height="12" rx="2" style="fill:var(--s2)"/><text x="566.0" y="18.0" text-anchor="start" font-size="12.5">after loading, to first DiT</text>
+<line x1="196.0" y1="38" x2="196.0" y2="142" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="196.0" y="157.0" text-anchor="middle" font-size="11" class="mut num">0</text>
+<line x1="332.0" y1="38" x2="332.0" y2="142" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="332.0" y="157.0" text-anchor="middle" font-size="11" class="mut num">20 s</text>
+<line x1="468.0" y1="38" x2="468.0" y2="142" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="468.0" y="157.0" text-anchor="middle" font-size="11" class="mut num">40 s</text>
+<line x1="604.0" y1="38" x2="604.0" y2="142" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="604.0" y="157.0" text-anchor="middle" font-size="11" class="mut num">60 s</text>
+<line x1="740.0" y1="38" x2="740.0" y2="142" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="740.0" y="157.0" text-anchor="middle" font-size="11" class="mut num">80 s</text>
+<line x1="196" y1="38" x2="196" y2="142" style="stroke:var(--axis)" stroke-width="1"/>
+<text x="740.0" y="172.0" text-anchor="end" font-size="11" class="mut">seconds from the first handler instruction · one real container nearest each configuration&#x27;s pooled median</text>
+<text x="184.0" y="60.5" text-anchor="end" font-size="12.5" font-weight="600" class="lbl">Ours</text>
+<rect x="196.0" y="46" width="2.4" height="20" rx="2" style="fill:var(--ctx)"><title>Ours: controller 0.0–0.5 s</title></rect>
+<rect x="199.4" y="46" width="43.6" height="20" rx="2" style="fill:var(--s1)"><title>Ours: parallel preloads 0.5–7.1 s</title></rect>
+<rect x="244.0" y="46" width="0.8" height="20" rx="2" style="fill:var(--s2)"><title>Ours: after load 7.1–7.2 s</title></rect>
+<text x="250.9" y="60.0" text-anchor="start" font-size="11" font-weight="600" class="lbl">first DiT 7.2 s</text>
+<text x="184.0" y="94.5" text-anchor="end" font-size="12.5" font-weight="600" class="lbl">SGLang · recommended</text>
+<rect x="196.0" y="80" width="210.4" height="20" rx="2" style="fill:var(--ctx)"><title>SGLang · recommended: bootstrap 0.0–31.1 s</title></rect>
+<text x="301.2" y="93.8" text-anchor="middle" font-size="10" style="fill:#ffffff">bootstrap 31 s</text>
+<rect x="407.4" y="80" width="77.9" height="20" rx="2" style="fill:var(--s1)"><title>SGLang · recommended: Qwen 31.1–42.7 s</title></rect>
+<text x="446.3" y="93.8" text-anchor="middle" font-size="10" style="fill:#ffffff">Qwen 12 s</text>
+<rect x="486.3" y="80" width="52.8" height="20" rx="2" style="fill:var(--s1)"><title>SGLang · recommended: DiT 42.7–50.6 s</title></rect>
+<rect x="540.1" y="80" width="25.4" height="20" rx="2" style="fill:var(--s1)"><title>SGLang · recommended: VAEs 50.6–54.5 s</title></rect>
+<rect x="566.5" y="80" width="73.9" height="20" rx="2" style="fill:var(--s2)"><title>SGLang · recommended: after load 54.5–65.5 s</title></rect>
+<text x="603.5" y="93.8" text-anchor="middle" font-size="10" style="fill:#ffffff">after load 11 s</text>
+<text x="641.5" y="76.0" text-anchor="end" font-size="11" font-weight="600" class="lbl">first DiT 65.5 s</text>
+<text x="184.0" y="128.5" text-anchor="end" font-size="12.5" font-weight="600" class="lbl">vLLM-Omni · recommended</text>
+<rect x="196.0" y="114" width="132.0" height="20" rx="2" style="fill:var(--ctx)"><title>vLLM-Omni · recommended: bootstrap 0.0–19.6 s</title></rect>
+<text x="262.0" y="127.8" text-anchor="middle" font-size="10" style="fill:#ffffff">bootstrap 20 s</text>
+<rect x="329.0" y="114" width="140.2" height="20" rx="2" style="fill:var(--s1)"><title>vLLM-Omni · recommended: pipeline + VAE 19.6–40.3 s</title></rect>
+<text x="399.2" y="127.8" text-anchor="middle" font-size="10" style="fill:#ffffff">pipeline + VAE 21 s</text>
+<rect x="470.3" y="114" width="3.8" height="20" rx="2" style="fill:var(--grid)"><title>vLLM-Omni · recommended: gap 40.3–41.0 s</title></rect>
+<rect x="475.1" y="114" width="117.0" height="20" rx="2" style="fill:var(--s1)"><title>vLLM-Omni · recommended: DiT weights 41.0–58.4 s</title></rect>
+<text x="533.6" y="127.8" text-anchor="middle" font-size="10" style="fill:#ffffff">DiT weights 17 s</text>
+<rect x="593.3" y="114" width="69.9" height="20" rx="2" style="fill:var(--s1)"><title>vLLM-Omni · recommended: Qwen 58.4–68.8 s</title></rect>
+<text x="628.2" y="127.8" text-anchor="middle" font-size="10" style="fill:#ffffff">Qwen 10 s</text>
+<rect x="664.2" y="114" width="33.6" height="20" rx="2" style="fill:var(--s2)"><title>vLLM-Omni · recommended: after load 68.8–73.9 s</title></rect>
+<text x="698.8" y="110.0" text-anchor="end" font-size="11" font-weight="600" class="lbl">first DiT 73.9 s</text>
+</svg><figcaption><strong>Figure 4. The Python engines spend 20 to 31 seconds before reading a weight, then load components one after another; ours loads them all at once and prepares the first request&#x27;s inputs alongside.</strong> One real container nearest each configuration&#x27;s median (SGLang Diffusion recommended, vLLM-Omni recommended with 4 loaders) on a shared axis. Single containers from different regions, not averages. Our loads run in parallel and overlap the first request&#x27;s preparation, which leaves 0.1 s after the last load; Figure 5 shows those steps in another container.</figcaption></figure>
+<table><thead><tr><th>One container near each median</th><th>SGLang Diffusion</th><th>vLLM-Omni</th><th>Ours</th></tr></thead><tbody><tr><td>Before the first weight is read</td><td>31 s</td><td>20 s</td><td>0.5 s</td></tr><tr><td>Loading the model components</td><td>23 s, one after another</td><td>49 s, one after another</td><td>6.6 s, in parallel</td></tr><tr><td>After loading, to the first denoising step</td><td>11 s</td><td>5 s</td><td>0.1 s</td></tr><tr><td><strong>First denoising step</strong></td><td><strong>65.5 s</strong></td><td><strong>73.9 s</strong></td><td><strong>7.2 s</strong></td></tr></tbody></table>
+<p>The Python engines spend most of their minute before and between loads: imports, service startup and device initialization come first, then the components load one after another, and vLLM-Omni's pipeline construction alone, with its VAEs, takes 21 seconds. Once everything is loaded, the first request still waits while its inputs are decoded, the text encoder runs, the frames are encoded and the DiT's input is laid out; ours starts that work while the weights are still loading, leaving 0.1 s after the last one lands. This is the LLM assumption at work. For a server that starts once and runs for days, thirty seconds of imports, a sequential load and a slow first request hardly matter. A video worker that starts with every burst pays them every time, and every one of those seconds sits between the user and the first frame.</p>
+<h2>What we changed</h2>
+<p>We rewrote the framework around the opposite assumption: a worker starts often and has to be useful within seconds. Three changes follow from it.</p>
+<p><strong>A much smaller bootstrap.</strong> Our framework is written in Rust and compiled before release, so unlike a PyTorch engine it has no machine-learning framework to import at startup; the Python engines in Figure 4 spend 20 to 31 seconds importing and initializing before they read a weight. The only Python left is a thin orchestration layer that uses the standard library alone. Our CUDA kernels are built for the B200 ahead of time, and the kernels we inherited from Triton, SGLang's sparse-attention router among them, ship as precompiled binaries checked by SHA-256, so nothing is compiled just in time. The first weight read begins within half a second of the handler starting.</p>
+<p><strong>Everything that can overlap does.</strong> Startup is a dependency graph, not a script. Components that do not depend on each other start loading together: in Figure 5 the text encoder, the DiT and the video encoder all start within the first 0.2 seconds. File reads start before the CUDA context exists, so creating it, often a second or more per component, hides behind I/O. Read buffers are registered with CUDA directly, so chunked reads stream into asynchronous uploads without a staging copy.<sup class="fnref" id="fnref-6"><a href="#fn-6">6</a></sup> While the weights are still arriving, the request's inputs are processed and its cuDNN plans are loaded, or built if no prepared plan matches its shape. Decoders that are needed only to produce the output video load while the denoising steps run, which take minutes, instead of before the first one. The Python engines load their VAEs before the first step, so our clock counts those seconds against them; deferring would help them too.</p>
+<figure id="fig-steps"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 266" role="img" aria-label="One cold container step by step. The video encoder, the DiT and the Qwen text encoder start loading together; the two frames are encoded as soon as the video encoder has loaded, the DiT input is laid out as soon as the DiT has loaded, and the prompt is encoded as soon as the text encoder has loaded; the first denoising step starts at 7.2 seconds. Output decoders load after the first step.">
+<rect x="150" y="10" width="12" height="12" rx="2" style="fill:var(--ctx)"/><text x="168.0" y="20.0" text-anchor="start" font-size="12.5">bootstrap</text>
+<rect x="250" y="10" width="12" height="12" rx="2" style="fill:var(--s1)"/><text x="268.0" y="20.0" text-anchor="start" font-size="12.5">loading weights</text>
+<rect x="388" y="10" width="12" height="12" rx="2" style="fill:var(--s2)"/><text x="406.0" y="20.0" text-anchor="start" font-size="12.5">work for the first request</text>
+<line x1="150.0" y1="44" x2="150.0" y2="226" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="150.0" y="241.0" text-anchor="middle" font-size="11" class="mut num">0</text>
+<line x1="206.2" y1="44" x2="206.2" y2="226" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="206.2" y="241.0" text-anchor="middle" font-size="11" class="mut num">1 s</text>
+<line x1="262.5" y1="44" x2="262.5" y2="226" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="262.5" y="241.0" text-anchor="middle" font-size="11" class="mut num">2 s</text>
+<line x1="318.8" y1="44" x2="318.8" y2="226" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="318.8" y="241.0" text-anchor="middle" font-size="11" class="mut num">3 s</text>
+<line x1="375.0" y1="44" x2="375.0" y2="226" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="375.0" y="241.0" text-anchor="middle" font-size="11" class="mut num">4 s</text>
+<line x1="431.2" y1="44" x2="431.2" y2="226" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="431.2" y="241.0" text-anchor="middle" font-size="11" class="mut num">5 s</text>
+<line x1="487.5" y1="44" x2="487.5" y2="226" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="487.5" y="241.0" text-anchor="middle" font-size="11" class="mut num">6 s</text>
+<line x1="543.8" y1="44" x2="543.8" y2="226" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="543.8" y="241.0" text-anchor="middle" font-size="11" class="mut num">7 s</text>
+<line x1="600.0" y1="44" x2="600.0" y2="226" style="stroke:var(--grid)" stroke-width="1"/>
+<text x="600.0" y="241.0" text-anchor="middle" font-size="11" class="mut num">8 s</text>
+<line x1="557.5" y1="44" x2="557.5" y2="226" style="stroke:var(--ink)" stroke-width="1" stroke-dasharray="3 3"/>
+<text x="557.5" y="40.0" text-anchor="middle" font-size="11" font-weight="600" class="lbl">first denoising step 7.2 s</text>
+<text x="140.0" y="65.0" text-anchor="end" font-size="12" class="lbl">Bootstrap</text>
+<rect x="150.6" y="52" width="7.1" height="18" rx="2" style="fill:var(--ctx)"><title>Bootstrap: 0.01–0.14 s</title></rect>
+<text x="140.0" y="95.0" text-anchor="end" font-size="12" class="lbl">Request setup (CPU)</text>
+<rect x="158.6" y="82" width="23.1" height="18" rx="2" style="fill:var(--s2)"><title>Request setup (CPU): 0.15–0.56 s</title></rect>
+<rect x="184.7" y="83" width="141.7" height="16" style="fill:var(--surface)"/>
+<text x="187.7" y="95.0" text-anchor="start" font-size="11" class="mut">shapes and noise 0.41 s</text>
+<text x="140.0" y="125.0" text-anchor="end" font-size="12" class="lbl">Video encoder</text>
+<rect x="158.2" y="112" width="106.8" height="18" rx="2" style="fill:var(--s1)"><title>Video encoder: 0.15–2.05 s</title></rect>
+<rect x="265.1" y="112" width="12.6" height="18" rx="2" style="fill:var(--s2)"><title>Video encoder: 2.05–2.27 s</title></rect>
+<rect x="280.7" y="113" width="171.2" height="16" style="fill:var(--surface)"/>
+<text x="283.7" y="125.0" text-anchor="start" font-size="11" class="mut">encode the two frames 0.22 s</text>
+<text x="140.0" y="155.0" text-anchor="end" font-size="12" class="lbl">DiT</text>
+<rect x="158.7" y="142" width="324.1" height="18" rx="2" style="fill:var(--s1)"><title>DiT: 0.15–5.92 s</title></rect>
+<rect x="482.8" y="142" width="47.1" height="18" rx="2" style="fill:var(--s2)"><title>DiT: 5.92–6.75 s</title></rect>
+<rect x="532.9" y="143" width="147.6" height="16" style="fill:var(--surface)"/>
+<text x="535.9" y="155.0" text-anchor="start" font-size="11" class="mut">lay out its input 0.84 s</text>
+<text x="140.0" y="185.0" text-anchor="end" font-size="12" class="lbl">Qwen text encoder</text>
+<rect x="158.7" y="172" width="383.9" height="18" rx="2" style="fill:var(--s1)"><title>Qwen text encoder: 0.15–6.98 s</title></rect>
+<rect x="542.5" y="172" width="12.5" height="18" rx="2" style="fill:var(--s2)"><title>Qwen text encoder: 6.98–7.20 s</title></rect>
+<rect x="558.0" y="173" width="147.6" height="16" style="fill:var(--surface)"/>
+<text x="561.0" y="185.0" text-anchor="start" font-size="11" class="mut">encode the prompt 0.22 s</text>
+<text x="140.0" y="215.0" text-anchor="end" font-size="12" class="lbl">Output decoders</text>
+<rect x="557.5" y="202" width="190.5" height="18" rx="2" style="fill:none;stroke:var(--axis)" stroke-dasharray="3 2"/>
+<text x="563.5" y="215.0" text-anchor="start" font-size="11" class="mut">load after the first step</text>
+<text x="600.0" y="257.0" text-anchor="end" font-size="10.5" class="mut">seconds from the first handler instruction</text>
+</svg><figcaption><strong>Figure 5. Each piece of the first request&#x27;s work starts as soon as what it needs has loaded.</strong> One of 30 cold containers from a profiling run on 29 October, with a later build than the study and tracing on (one B200, us-west): the one nearest the study&#x27;s 7.21-second median, at 7.24 s (this run&#x27;s median: 7.74 s). Load bars include setup, reads, allocation and upload. The two frames are encoded while the DiT and the text encoder are still loading, the DiT&#x27;s input is laid out while the text encoder is still loading, and the prompt is encoded as soon as the text encoder lands. The run stopped each container at its first step and none had loaded an output decoder; their lane shows where they load, not a timing.</figcaption></figure>
+<p><strong>Work done once, not on every start.</strong> Anything that can be known before a request arrives is computed before deployment, and a worker reads only what inference uses. Weights are repacked from the official checkpoint: the text encoder stops at the layer H3 conditions on, and the DiT's AdaLN projections, 26 of its 66 GB, become small modulation tables for the timesteps of the deployed step schedule, so a worker reads about 95 GB where the checkpoint's DiT and text encoder alone are 133. The router kernels are compiled, and cuDNN plans are prepared for the shapes our traffic has used over the past few months, keyed to the exact shape, GPU and library versions, so a worker reads bytes it can use as they are. In our test this preparation took about 70 s, once per deployment: about what each Python engine spends on every cold start.<sup class="fnref" id="fnref-7"><a href="#fn-7">7</a></sup></p>
+<p>Starting fast does not make inference slower. Nothing on our path compiles, tunes or caches on first use, so the first request in a fresh process runs within 0.03% of the speed of a warm one. Warm, an H3 request on the same B200 runs at least as fast as on SGLang Diffusion and vLLM-Omni (1.5% and 0.8% less time), and its output matches SGLang Diffusion's bit for bit.<sup class="fnref" id="fnref-8"><a href="#fn-8">8</a></sup></p>
+<p>None of this is free. A general framework serves dozens of models from one codebase; we port each model by hand into native code, and the port is most of the work. So far that covers MiniMax H3, LTX 2.5 and two Wan 2.1-based models, and the same loader brings the official Wan 2.1 I2V checkpoint to its first denoising step in a median 8.9 seconds.<sup class="fnref" id="fnref-9"><a href="#fn-9">9</a></sup> Precomputing also fixes choices: the modulation tables hold one step schedule, so changing the schedule means preparing again. For models that start with every burst, the trade has paid off for us.</p>
+<h2>Owning the whole inference path</h2>
+<p>We did rewrite our inference engine in Rust, but the language is not what we set out to change. What we wanted most was to own our whole inference path, end to end. Our runtime owns it at fine grain: storage readers, host memory, PCIe transfers, the moment the CUDA context is created, GPU memory and CUDA streams. Each change above is a decision about one of those resources that a general-purpose framework usually makes for you.</p>
+<p>That control lets us work from first principles. We expected startup to take seconds because we measured what the hardware allows: a Modal container reads 11 to 22 GB/s from its region's warm cache, so everything one of our workers reads takes four to nine seconds, and that read is the only real limit the hardware sets. Everything else on the path was software, and ours to change. Working this way has taught us more as we added features to our framework; those lessons are for follow-up posts, so stay tuned.</p>
+<h2>Why we are opening it up</h2>
+<p>Making each generation run faster has drawn enormous effort from the community: FlashAttention, sparse attention, fused kernels, caching across denoising steps (TeaCache, EasyCache, First Block Cache), all aimed at getting more out of every GPU second. We build on that work and are grateful for it. As a field, we have made GPUs very efficient during inference; we should make them equally efficient between inferences. That is the other half of GPU efficiency, and it is where we hope to contribute back.</p>
+<p>It matters beyond any one company's bill, because GPUs are scarce. A GPU kept idle for the next burst is one nobody else can use; a GPU released seconds after its last request goes back to the provider, where another team can run on it. So faster startup does more than save money: it lets the same scarce GPUs serve more of the people waiting for them. We have not measured how much capacity this frees, but it is where the incentives point.</p>
+<p>We built this runtime because we needed it, and we are opening it up because the problem is not only ours: every team serving large video models with on-demand GPUs pays for slow startup in waiting users and idle GPUs, and we think every serving stack should start in seconds. The code is at <a href="https://github.com/creatify-ai/native-video-inference">github.com/creatify-ai/native-video-inference</a>, with Modal examples, so you can try the startup yourself; Appendix B says what to expect on a first run. Much of what we describe could live in SGLang Diffusion or vLLM-Omni too, and we would be glad to help bring it there. We have started with SGLang Diffusion: Appendix C says what we think carries over, what does not, and what a first branch does.</p>
+<p>Looking ahead, we think the same approach reaches beyond video. As an early sign of that potential, we ported DeepSeek-V4 the same way: on a host that has read the weights, <a href="https://github.com/creatify-ai/native-video-inference/blob/main/models/deepseek_v4_flash/README.md">DeepSeek-V4-Flash</a> reaches its first token 7 to 9 seconds after its process starts on one B300, and <a href="https://github.com/creatify-ai/native-video-inference/blob/main/models/deepseek_v4_pro/README.md">DeepSeek-V4-Pro</a> in about 27 seconds on eight, some 20 to 60 times sooner than a stock SGLang server becomes ready, with outputs that match SGLang's bit for bit. LLM serving is not our focus and the Pro port has had no performance tuning, but it suggests that large language models could start in seconds too.</p>
+<p>At that scale a slow start is a bill, and it decides how the GPUs can be bought at all. Eight B300s cost about $57 an hour on demand (Modal's list price on 11 November 2026: $0.001972 per second per B300, $56.8 an hour for eight), so a start of 19.8 minutes costs about $19 before the first token, and a five-minute job on top of it is 80% startup. Nobody rents that way: with starts of twenty to thirty minutes the only workable choice is to reserve the GPUs and keep them warm, used or not. At 27 seconds the same start costs about 42 cents, 8% of that five-minute job, and renting eight GPUs for five minutes becomes reasonable. That is what makes on-demand possible for models this large, and it lets a provider or a large cluster share the same GPUs across tenants by traffic and by time of day instead of leaving them reserved and idle. We would be glad to help the industry find that on-demand GPU time in the hardware it already has.</p>
+<h2>Appendix A: How we measured</h2>
+<p>Startup benchmarks are easy to get wrong, so this is exactly what the study measured and what it did not. First, what the configuration names mean. Figure 1 shows each engine's fastest configuration and its recommended one; the table after the contract has all ten.</p>
+<table><thead><tr><th>Configuration</th><th>What it is</th></tr></thead><tbody><tr><td>SGLang · short startup</td><td>SGLang Diffusion's speed performance mode, eager execution (no torch.compile), built-in warmup off, FSDP off, cuDNN attention</td></tr><tr><td>… direct GPU loading</td><td>SGLang's --direct-gpu-weight-loading option, off by default. It reads the unquantized DiT checkpoint straight into GPU memory instead of staging it in CPU memory first, at the cost of holding the checkpoint and the model weights in GPU memory together while loading; it requires a GPU-resident DiT. In this study it cut the short-startup median from 73.07 s to 64.70 s, SGLang's fastest configuration. It applies to the DiT only.</td></tr><tr><td>SGLang · recommended configuration</td><td>The startup settings SGLang's documentation recommends: speed preset, resident components, eager, platform attention, automatic encoder placement, direct GPU loading on, warmup off</td></tr><tr><td>SGLang · default HTTP server, warmup off</td><td>The HTTP server at its defaults, with only the built-in warmup turned off so that the first DiT forward belongs to the measured request</td></tr><tr><td>vLLM-Omni · offline default</td><td>The offline Python API at its defaults, for the FL2VA task on one GPU</td></tr><tr><td>vLLM-Omni · default HTTP server</td><td>The HTTP server at its defaults</td></tr><tr><td>vLLM-Omni · recommended HTTP, N loaders</td><td>The HTTP server as vLLM-Omni's H3 recipe recommends (FL2VA only, resident, eager, TRTLLM attention), with 4 or 16 parallel weight-loader threads</td></tr><tr><td>vLLM-Omni · offline eager, 16 loaders</td><td>The offline API in eager mode with 16 weight-loader threads</td></tr></tbody></table>
+<table class="contract"><thead><tr><th>Control</th><th>Value</th></tr></thead><tbody>
+<tr><td><strong>Study</strong></td><td>Ten configurations × three Modal regions (us-west, ap-south and eu-north) × 50 cold containers, 1,500 containers, completed 21 October 2026</td></tr>
+<tr><td><strong>Ours</strong></td><td>Our runtime, FL2VA with parallel preloads; the measured build is pinned in the repository as [NATIVE_PIN]</td></tr>
+<tr><td><strong>Workload</strong></td><td>MiniMax-H3 FL2VA, official Base BF16 weights (no Turbo or GRPO); MiniMaxAI/MiniMax-H3 revision 42ed227; 28-step recipe, 768 × 768, 124 frames, seed 0; one gradient input PNG and one prompt for every run; the first DiT forward is entered, never executed</td></tr>
+<tr><td><strong>Hardware</strong></td><td>One NVIDIA B200 per container on Modal; 16 physical CPU cores and 192 GiB requested; host CPU model recorded, not pinned (placement below)</td></tr>
+<tr><td><strong>SGLang Diffusion, pinned</strong></td><td>sgl-project/sglang 77ba54f plus two public kernel files from 961bcf4; four configurations: short startup with direct GPU weight loading on or off (performance mode speed, eager, warmup off, FSDP off, cuDNN attention, text encoder TORCH_SDPA, TF32 off); default HTTP server with only warmup off; recommended configuration (official speed, resident, eager presets, platform attention and encoder auto, documented opt-in direct GPU loading, warmup off)</td></tr>
+<tr><td><strong>vLLM-Omni, pinned</strong></td><td>vllm-project/vllm-omni 83afc05; five configurations: offline Python API at defaults (model, class, trust_remote_code, task_type fl2va, one GPU); offline eager with 16 weight-loader threads; default HTTP server; recommended HTTP server (single FL2VA, resident, eager, TRTLLM attention) with 4 and with 16 parallel loader threads</td></tr>
+<tr><td><strong>Clock starts</strong></td><td>First cloud-handler instruction in the container</td></tr>
+<tr><td><strong>Clock stops</strong></td><td>CUDA-synchronized entry of the first DiT host forward, before it executes</td></tr>
+<tr><td><strong>Clock includes</strong></td><td>File prefetch, imports and engine initialization, required weight reads and host-to-device transfers, input preprocessing, conditioning and encoding</td></tr>
+<tr><td><strong>Clock excludes</strong></td><td>GPU allocation, queueing and machine boot, weight downloads, image build and compilation, offline weight preparation, DiT forward compute</td></tr>
+<tr><td><strong>Not claimed</strong></td><td>That any configuration is the engine&#x27;s global optimum; the recommended configurations follow published startup guidance without a parameter search. Region and CPU differences are observational</td></tr>
+</tbody></table>
+<p class="tablenote">All ten configurations, seconds from the first handler instruction to the first DiT entry. Pooled columns cover 150 cold containers each; the regional columns are the median over 50.</p>
+<table class="contract"><thead><tr><th>Configuration</th><th class="num">P50</th><th class="num">P90</th><th class="num">us-west P50</th><th class="num">ap-south P50</th><th class="num">eu-north P50</th></tr></thead><tbody>
+<tr><td>Ours</td><td class="num"><strong>7.21</strong></td><td class="num">19.88</td><td class="num">5.39</td><td class="num">14.59</td><td class="num">6.80</td></tr>
+<tr><td>SGLang: short startup, direct GPU loading on</td><td class="num"><strong>64.70</strong></td><td class="num">119.31</td><td class="num">62.47</td><td class="num">114.37</td><td class="num">63.27</td></tr>
+<tr><td>SGLang: recommended configuration</td><td class="num"><strong>65.40</strong></td><td class="num">121.16</td><td class="num">62.54</td><td class="num">113.97</td><td class="num">63.63</td></tr>
+<tr><td>vLLM-Omni: offline default</td><td class="num"><strong>71.50</strong></td><td class="num">126.03</td><td class="num">69.41</td><td class="num">119.99</td><td class="num">70.38</td></tr>
+<tr><td>vLLM-Omni: offline eager, 16 loaders</td><td class="num"><strong>72.14</strong></td><td class="num">122.54</td><td class="num">69.72</td><td class="num">118.63</td><td class="num">71.09</td></tr>
+<tr><td>SGLang: short startup, direct GPU loading off</td><td class="num"><strong>73.07</strong></td><td class="num">140.37</td><td class="num">71.35</td><td class="num">131.50</td><td class="num">70.06</td></tr>
+<tr><td>vLLM-Omni: default HTTP server</td><td class="num"><strong>73.68</strong></td><td class="num">126.57</td><td class="num">71.28</td><td class="num">118.28</td><td class="num">72.27</td></tr>
+<tr><td>vLLM-Omni: recommended HTTP, 4 loaders</td><td class="num"><strong>73.98</strong></td><td class="num">124.11</td><td class="num">70.97</td><td class="num">118.84</td><td class="num">72.65</td></tr>
+<tr><td>vLLM-Omni: recommended HTTP, 16 loaders</td><td class="num"><strong>74.52</strong></td><td class="num">125.70</td><td class="num">71.85</td><td class="num">118.93</td><td class="num">73.32</td></tr>
+<tr><td>SGLang: default HTTP server, warmup off</td><td class="num"><strong>75.00</strong></td><td class="num">140.67</td><td class="num">70.96</td><td class="num">135.17</td><td class="num">72.09</td></tr>
+</tbody></table>
+<p class="tablenote">The region selector does not fix the host CPU. ap-south placed every container on Intel Xeon 8559C hosts and was slower for every configuration; us-west and eu-north were mostly AMD EPYC 9575F. The pooled figures weight the three regions equally, so the regional columns are the controlled view.</p>
+<h2>Appendix B: The platform underneath</h2>
+<p>The body of this post treats the platform's own startup as a few seconds. That depends on the provider, and it is the first thing to check if you reproduce our numbers. We measured four B200 platforms on 19 and 20 October 2026, and today only two of them, Modal and fal, start a new serverless container in seconds. Together AI copies the weight volume to each new node first, and Nebius boots a new virtual machine for every job, so there the platform alone takes from tens of seconds to minutes.</p>
+<table><thead><tr><th>Platform</th><th>A new container starts in</th><th>Weight reads in a new container</th><th>What limits a cold start</th></tr></thead><tbody><tr><td>Modal</td><td>2 to 9 s, 36 s at 30 containers</td><td>0.5 to 2.3 GB/s cold; 11 to 22 GB/s on AMD hosts after one earlier read in the region</td><td>The first read in a region; GPU capacity by region and hour</td></tr><tr><td>fal</td><td>3 to 15 s with the image on the host, about 60 s more for an image pull</td><td>1.0 to 3.0 GB/s cold; 2.7 to 6.6 GB/s on a new host after an earlier read</td><td>A smaller cache effect</td></tr><tr><td>Together AI</td><td>16 to 90 s, including a copy of the volume to the node</td><td>13 to 62 GB/s from that local copy</td><td>Each new node copies the volume again</td></tr><tr><td>Nebius</td><td>2 to 6 minutes: a new virtual machine per job</td><td>8.4 to 9.6 GB/s, cold or warm</td><td>The machine boot</td></tr></tbody></table>
+<p>No runtime can hide that layer: the seven seconds in this post need a platform that starts the container itself in seconds, and we leave that layer to the platforms. In production, the platform's own scheduling also sets the tail of the wait for a new container.</p>
+<p><strong>Reproducing seven seconds.</strong> Use Modal: it is where we ran the study, and the repository's examples target it. Our study did not clear caches, so it measures regions whose cache already held the weights. On Modal, the first read of a new volume in a region is cold, at 0.5 to 2.3 GB/s, so your first containers can take one to three minutes to read a full worker's weights; later containers read from the warm cache. Run several containers rather than one: our median was 7.21 s and our 90th percentile 19.88 s, and hosts with Intel Xeon 8559C CPUs were slower than AMD EPYC 9575F hosts for every engine we tested.</p>
+<h2>Appendix C: Bringing this to SGLang Diffusion</h2>
+<p>SGLang Diffusion is close to our H3 work: our runtime runs its sparse-attention router kernels, and its output is the reference ours matches bit for bit. So it is the first place we want to bring this work, and we have tried the ideas of this post on a branch of SGLang Diffusion's main, serving MiniMax H3 on one B200.</p>
+<p>On 5 November 2026 we ran both versions on Modal in us-west, 50 containers each in the same round, timed from the serving handler's entry to the first DiT forward. On fast hosts, main reached the first denoising step at a median of 79.0 seconds and the branch at 20.1. On the two slower kinds of host, the medians fell from 152.9 to 31.9 seconds and from 161.6 to 42.8. Full 28-step runs produce identical frames, and a denoising step still takes 1.29 seconds. This is a newer main and a separate round from the study in Appendix A, so its numbers are not comparable with Figure 1.</p>
+<table><thead><tr><th>What we do in our runtime</th><th>In SGLang Diffusion</th></tr></thead><tbody><tr><td>Weights are read while everything else starts</td><td>Doable: on our branch, helper processes that do not import torch read the checkpoint into the page cache or GPU memory while the worker imports, all 128.8 GB by 14 seconds</td></tr><tr><td>Pinned reads stream into GPU uploads</td><td>Doable: on our branch, the text encoder and VAE load straight to the GPU through a pinned 16-thread reader</td></tr><tr><td>Nothing compiles on first use</td><td>Mostly doable: on our branch, JIT, Triton and CuTe caches built into the image take the first request from 12.8 to 1.25 seconds. The caches are tied to the image and the GPU</td></tr><tr><td>A small bootstrap</td><td>Partly doable: on our branch, the worker starts while the launcher is still resolving arguments, bytecode ships in the image and optional imports wait until they are used. Importing torch and the runtime still takes 12 seconds</td></tr><tr><td>Reading only what inference uses</td><td>Partly doable: on our branch, prefetch skips the text encoder's layers past the one H3 uses. SGLang's AdaLN cache option could skip the 26 GB of AdaLN projections for a fixed step schedule; not tried yet</td></tr><tr><td>Output decoders load after the first step</td><td>Doable, but worth little: the video VAE loads in 0.4 seconds on our branch</td></tr><tr><td>No collective setup on one GPU</td><td>Doable: on our branch, distributed setup drops from 0.65 to 0.16 seconds</td></tr><tr><td>Components load in parallel</td><td>Hard in one Python process: the GIL and process-wide loading state get in the way, so our branch moves the reading into other processes instead</td></tr><tr><td>The first request is prepared while weights load</td><td>Hard: the server takes requests only once it is ready, and pipeline stages run in order. On our branch only 1.25 seconds are left there</td></tr></tbody></table>
+<p>Three things we tried on the branch did not help: direct I/O (buffered reads already reach 16 to 17 GB/s), creating the CUDA context earlier (it is already cheap there) and replaying the file reads of an earlier start.</p>
+<p>We would like to offer this upstream as small pull requests and a cookbook page: the new startup features off by default behind flags, each change with its own same-round measurement, and no change to the numerics. The <a href="sglang-cold-start-proposal.md">proposal</a> has the per-phase numbers, the pull requests we have in mind and the questions we would like the maintainers to answer first. It is a proposal, not a finished patch set. If the SGLang team wants it, we would be glad to contribute it and to shape it the way they want the code to look, and we would be just as glad to help the vLLM-Omni team.</p>
+<h2 class="notes-h">Notes</h2>
+<p class="footnote" id="fn-1"><span class="fnnum">1</span> MiniMax H3 FL2VA (MiniMaxAI/MiniMax-H3 revision 42ed227, official Base BF16 weights), 28-step recipe, 768 × 768, 124 frames, one B200 per container; ten configurations × three Modal regions × 50 cold containers, completed 21 October 2026. The clock runs from the first instruction of the cloud handler to the entry of the first DiT forward, before it computes: it includes imports, engine initialization, weight reads and uploads, and input encoding, and excludes GPU allocation, queueing, machine boot, downloads, image builds and offline weight preparation. Ratios compare our median with the fastest configuration of each engine. The full contract and all ten configurations are in Appendix A. We also measured two-B200 containers, in fewer runs; they reach the first denoising step in about the same time. <a class="fnback" href="#fnref-1" aria-label="back to text">↩</a></p>
+<p class="footnote" id="fn-2"><span class="fnnum">2</span> DeepSeek's <a href="https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md">inference system overview</a> reports, for 27 to 28 February 2025, an average decode output of about 14,800 tokens per second per H800 node of eight GPUs and an average output speed of 20 to 22 tokens per second per user. Dividing one by the other gives about 670 to 740 sequences in flight per node, 84 to 93 per GPU, or eight to nine thousand per hundred GPUs. This counts decode only; DeepSeek runs prefill on separate nodes. A different model on different hardware, used only for the order of magnitude. On batching video, vLLM-Omni's published MiniMax H3 recipe reports four step-batched requests finishing in 182.1 s, against 174.8 s served one after another, for its own configuration on two H100s: a third-party measurement of a different setup, cited only to show that batching gains for large video DiTs have a different shape than for LLM decode. Smaller or offload-heavy diffusion workloads can still benefit from batching. The quotation is from fal's <a href="https://fal.ai/learn/serverless/ai-inference-provider-for-generative-media">guide to generative-media inference</a> (13 October 2026). <a class="fnback" href="#fnref-2" aria-label="back to text">↩</a></p>
+<p class="footnote" id="fn-3"><span class="fnnum">3</span> A round 70 s is an example of generation length, not a measurement. A longer generation narrows the gap and a shorter one widens it: at the roughly 155 s the request in note 8 takes on one B200, generation is 42% of the cycle with a 70-second startup and 88% with a 7-second one. <a class="fnback" href="#fnref-3" aria-label="back to text">↩</a></p>
+<p class="footnote" id="fn-4"><span class="fnnum">4</span> A replay of our production requests on Modal, each with its arrival time and measured processing time. Every simulated worker is one GPU serving one request at a time, provisioned on demand without a cap, and each model keeps its own pool; startup and idle retention are the only variables. Platform scheduling is not modeled: every new container takes exactly the stated startup, while in production the slowest few percent of requests also wait for the platform to schedule one (Appendix B). GPU time is compared with the 70-second case. Modeled allocation, not billing. <a class="fnback" href="#fnref-4" aria-label="back to text">↩</a></p>
+<p class="footnote" id="fn-5"><span class="fnnum">5</span> From the request to the first line of our code in the container, measured on 19 and 20 October 2026: Modal 2 to 9 s, 36 s at 30 containers; fal 3 to 15 s with the image on the host, about 60 s more for an image pull. Other platforms, and what they mean for startup, are in Appendix B. <a class="fnback" href="#fnref-5" aria-label="back to text">↩</a></p>
+<p class="footnote" id="fn-6"><span class="fnnum">6</span> The reads are checked. Each prepared file is hashed in full once, when it is prepared; before use, each tensor's first and last kilobyte are compared with a manifest whose own SHA-256 is pinned. The framework can also hash every byte again in the background after the first request. Neither SGLang Diffusion nor vLLM-Omni, at the versions in Appendix A, nor the official MiniMax H3 code hashes the weights when loading them, so this check is extra work, not a shortcut. <a class="fnback" href="#fnref-6" aria-label="back to text">↩</a></p>
+<p class="footnote" id="fn-7"><span class="fnnum">7</span> One run on 20 October 2026 in a container built from the public Dockerfile, with the official checkpoint already downloaded. Starting from an empty native model directory, the default validation command extracted and converted the tensors, generated the tables, compiled the router kernels, prepared the cuDNN plans and ran a fresh-process probe to the first DiT entry in 69.7 s, 3.5 s of it the probe. It excludes the weight download and the image build. <a class="fnback" href="#fnref-7" aria-label="back to text">↩</a></p>
+<p class="footnote" id="fn-8"><span class="fnnum">8</span> 22 October 2026: H3 FL2VA, 1376 × 768, 124 frames, one B200 per container. Ten GPUs each ran our runtime, SGLang Diffusion and vLLM-Omni in balanced order with matching cuDNN attention, two warm-up requests and one measured request of 49 model evaluations, timed end to end from input processing to the saved MP4: 154.7 s against 157.0 s and 156.0 s. CUDA graphs and torch.compile were off in every engine, so this compares the engines without them. Ours was faster in every pair, and its sampler output matched SGLang's bit for bit. Cold against warm compares the denoising stage of the first request in a fresh process (30 runs) with the third request (10 runs): 151.62 s against 151.58 s. One request shape, not a workload. <a class="fnback" href="#fnref-8" aria-label="back to text">↩</a></p>
+<p class="footnote" id="fn-9"><span class="fnnum">9</span> Official Wan 2.1 I2V-14B weights in BF16, ten cold containers on one B200 with 16 vCPUs, from function entry to the start of the first DiT forward: median 8.9 s, P90 18.0 s. Allocation and image pull are excluded. <a class="fnback" href="#fnref-9" aria-label="back to text">↩</a></p>
+</main>
+</body>
+</html>

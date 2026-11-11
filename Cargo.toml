@@ -11,7 +11,8 @@ members = [
     "models/minimax_h3_official/video_vae/router",
     "models/minimax_h3_official/audio_vae",
     "models/wan2.1",
-    "models/ltx25"
+    "models/ltx25",
+    "models/deepseek_v4_flash"
 ]
 
 [profile.release]

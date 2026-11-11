@@ -28,5 +28,6 @@ jobs:
           H3_CHECK_ONLY: "1"
           WAN_CHECK_ONLY: "1"
           LTX25_CHECK_ONLY: "1"
+          DSV4_CHECK_ONLY: "1"
           NATIVE_CORE_CHECK_ONLY: "1"
         run: cargo check --locked --workspace --all-targets --all-features
