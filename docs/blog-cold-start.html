@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>How We Made Video Model Cold Starts 10× Faster and Halved GPU Time</title>
+<title>How We Made Video Model Cold Starts 10× Faster and Cut Idle GPU Time by 84%</title>
 <meta name="description" content="Seven seconds to the first denoising step on a fresh B200, against 65 to 75 for SGLang Diffusion and vLLM-Omni. On our production traffic, that cuts idle GPU time by 84%.">
 <style>
 :root{color-scheme:light;--page:#ffffff;--surface:#fcfcfb;--ink:#0b0b0b;--ink-2:#52514e;--muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;--border:rgba(11,11,11,.10);--ctx:#b8b7b0;--s1:#2a78d6;--s2:#eb6834;--s1-wash:rgba(42,120,214,.16);--note-bg:#fbf6e9;--note-border:#d9b95a}
@@ -88,7 +88,7 @@ p.tablenote{font-size:12.5px;color:var(--muted);margin:-14px 0 22px}
 </head>
 <body>
 <main>
-<h1>How We Made Video Model Cold Starts 10× Faster and Halved GPU Time</h1>
+<h1>How We Made Video Model Cold Starts 10× Faster and Cut Idle GPU Time by 84%</h1>
 <p class="subtitle">Seven seconds to the first denoising step on a fresh B200, against 65 to 75 for SGLang Diffusion and vLLM-Omni. On our production traffic, that cuts idle GPU time by 84%.</p>
 <div class="strip">
 <div class="tile"><div class="big">≈10×</div><div class="what">faster cold start</div><div class="detail">7.21 s to the first denoising step, against 64.70 s for SGLang Diffusion and 71.50 s for vLLM-Omni; median of 150 cold B200 containers each</div></div>
