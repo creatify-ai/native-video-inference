@@ -1,4 +1,4 @@
-# How We Made Video Model Cold Starts 10× Faster and Halved GPU Time
+# How We Made Video Model Cold Starts 10× Faster and Cut Idle GPU Time by 84%
 
 *Seven seconds to the first denoising step on a fresh B200, against 65 to 75 for SGLang Diffusion and vLLM-Omni. On our production traffic, that cuts idle GPU time by 84%.*
 
